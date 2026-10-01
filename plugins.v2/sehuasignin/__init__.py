@@ -55,7 +55,7 @@ class SehuaSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.6.2"
+    plugin_version = "1.7.2"
     # 插件作者
     plugin_author = "local"
     # 插件配置项ID前缀
