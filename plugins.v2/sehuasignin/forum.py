@@ -17,10 +17,33 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 AGE_GATE_TEXTS = ("请点此进入", "please click here", "点击进入")
 # 单篇帖子正文保留的最大字符数
 MAX_POST_CHARS = 4000
+# 帖子正文允许保留的图片数量上限
+MAX_POST_IMAGES = 30
+# 原图地址的匹配规则（Discuz 正文中的 img 标签）
+IMG_SRC_PATTERN = re.compile(r'<img[^>]+src\s*=\s*["\']([^"\']+)["\'][^>]*>', re.I)
 
 
 class SehuaForumError(Exception):
     """论坛操作中可直接呈现给用户的异常。"""
+
+
+def extract_image_urls(raw: str, limit: int = MAX_POST_IMAGES) -> List[str]:
+    """提取帖子正文中的图片地址。
+
+    :param raw: 帖子正文 HTML 片段
+    :param limit: 最多返回的图片数量
+    :return: 图片地址列表（按出现顺序去重）
+    """
+    urls: List[str] = []
+    for matched in IMG_SRC_PATTERN.findall(raw or ""):
+        url = html_lib.unescape(matched).strip()
+        if not url or url.startswith(("static/", "/static/", "data:")):
+            continue
+        if url not in urls:
+            urls.append(url)
+        if len(urls) >= limit:
+            break
+    return urls
 
 
 def html_to_text(raw: str) -> str:
@@ -554,8 +577,16 @@ class SehuaForumSession:
                 posted = html_lib.unescape(stamp).replace("发表于", "").strip()
                 posted = re.sub(r"\s+", " ", posted)[:24]
             text = html_to_text(content)
-            if text or author:
-                posts.append({"author": author, "time": posted, "content": text})
+            images = extract_image_urls(content)
+            if text or author or images:
+                posts.append(
+                    {
+                        "author": author,
+                        "time": posted,
+                        "content": text,
+                        "images": images,
+                    }
+                )
 
         page_numbers = [int(item) for item in re.findall(rf"tid={tid}&(?:amp;)?page=(\d+)", html)]
         return {
