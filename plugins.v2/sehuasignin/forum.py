@@ -59,6 +59,34 @@ def extract_image_urls(raw: str, limit: int = MAX_POST_IMAGES) -> List[str]:
     return urls
 
 
+def strip_attachment_tips(raw: str) -> str:
+    """去掉附件图片块中的隐藏提示（文件名、大小、下载次数、下载附件、上传时间）。
+
+    Discuz 把附件信息放在 ``<ignore_js_op>`` 内一个默认隐藏的浮层里，直接转文本会
+    把这些元数据混进正文；这里只保留该块内的图片标签。
+
+    :param raw: 帖子正文 HTML 片段
+    :return: 处理后的 HTML 片段
+    """
+    if not raw:
+        return ""
+
+    def keep_images(matched: "re.Match") -> str:
+        """把附件块替换为其内部的图片标签。"""
+        return " ".join(IMG_TAG_PATTERN.findall(matched.group(0)))
+
+    text = re.sub(r"<ignore_js_op>.*?</ignore_js_op>", keep_images, raw, flags=re.S | re.I)
+    # 兜底清理残留的附件浮层与下载链接
+    text = re.sub(
+        r'<div[^>]*class="[^"]*aimg_tip[^"]*"[^>]*>.*?<div class="tip_horn">.*?</div>\s*</div>',
+        "",
+        text,
+        flags=re.S | re.I,
+    )
+    text = re.sub(r"<a[^>]*>\s*下载附件\s*</a>", "", text, flags=re.S | re.I)
+    return text
+
+
 def html_to_text(raw: str) -> str:
     """把帖子正文 HTML 转换为适合展示的纯文本。
 
@@ -67,7 +95,7 @@ def html_to_text(raw: str) -> str:
     """
     if not raw:
         return ""
-    text = raw
+    text = strip_attachment_tips(raw)
     # 图片由前端单独渲染，这里只去掉标签，避免出现多余的文字占位
     text = re.sub(r"<img[^>]*>", "", text, flags=re.I)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
