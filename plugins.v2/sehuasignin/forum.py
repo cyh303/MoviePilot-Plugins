@@ -24,6 +24,14 @@ IMG_TAG_PATTERN = re.compile(r"<img\b[^>]*>", re.I)
 IMG_ATTR_PATTERN = re.compile(r"""([\w-]+)\s*=\s*["']([^"']*)["']""")
 # 取图时依次尝试的属性名
 IMG_URL_ATTRS = ("file", "zoomfile", "src")
+# 楼层正文的结束标记：下一个楼层的容器，以及本楼层的页脚（点评、收藏、举报等）
+BODY_END_MARKERS = (
+    '<div id="comment_',
+    '<div class="pct">',
+    '<div class="pstl',
+    '<h3 class="psth',
+    '<div class="pob',
+)
 
 
 class SehuaForumError(Exception):
@@ -105,7 +113,9 @@ def html_to_text(raw: str) -> str:
     text = re.sub(r"<[^>]+>", "", text)
     text = html_lib.unescape(text)
     text = re.sub(r"[ \t\u00a0]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    # 图片标签被移除后会留下成片空白，统一收拢，避免正文出现大量空行
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{2,}", "\n", text)
     text = text.strip()
     if len(text) > MAX_POST_CHARS:
         text = text[:MAX_POST_CHARS] + "……（内容过长已截断）"
@@ -604,8 +614,26 @@ class SehuaForumSession:
         fid = fid_matched.group(1) if fid_matched else ""
 
         posts: List[Dict[str, str]] = []
-        for matched in re.finditer(r'id="postmessage_(\d+)"[^>]*>(.*?)</td>', html, re.S):
-            pid, content = matched.group(1), matched.group(2)
+        # 楼层正文以「下一个楼层标记」为边界，再用 class="pct" 收尾。
+        # 正文里含嵌套表格，按第一个 </td> 截断会丢失后半段内容——纯图片楼层
+        # 因此会整层读空，表现为「内容为空，只看到别人的评论」。
+        markers = list(re.finditer(r'id="postmessage_(\d+)"[^>]*>', html))
+        for position, matched in enumerate(markers):
+            pid = matched.group(1)
+            boundary = (
+                markers[position + 1].start() if position + 1 < len(markers) else len(html)
+            )
+            content = html[matched.end(): boundary]
+            # 正文与楼层页脚（点评、评分、收藏、举报）同在楼层的容器内，
+            # 取最早出现的结束标记即可只保留正文与图片。
+            cuts = [
+                position
+                for marker in BODY_END_MARKERS
+                if (position := content.find(marker)) > 0
+            ]
+            if cuts:
+                content = content[: min(cuts)]
+
             before = html[max(0, matched.start() - 12000): matched.start()]
             authors = re.findall(r'class="xw1"[^>]*>([^<]{1,30})</a>', before)
             author = authors[-1].strip() if authors else ""
