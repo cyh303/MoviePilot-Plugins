@@ -37,7 +37,7 @@ class SehuaSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     # 插件作者
     plugin_author = "local"
     # 插件配置项ID前缀
@@ -187,13 +187,28 @@ class SehuaSignIn(_PluginBase):
             },
         ]
 
+    # ------------------------------------------------------------ 通用响应封装
+    @staticmethod
+    def _envelope(success: bool, message: str, data: Any = None) -> Dict[str, Any]:
+        """构造插件 API 的标准响应体。
+
+        MoviePilot 前端要求插件接口返回恰好包含 success、message、data 三个字段的
+        响应体，多一个或少一个字段都会被判定为无效响应；因此统一在此处封装。
+
+        :param success: 是否成功
+        :param message: 结果说明
+        :param data: 附加数据
+        :return: 标准响应字典
+        """
+        return {"success": bool(success), "message": str(message or ""), "data": data}
+
     def api_signin(self) -> Dict[str, Any]:
         """手动触发一次签到并返回结果。
 
         :return: 执行结果字典
         """
         success, message = self.signin()
-        return {"success": success, "message": message}
+        return self._envelope(success, message)
 
     # ------------------------------------------------------------ 论坛浏览支持
     def _forum_signature(self) -> str:
@@ -403,7 +418,7 @@ class SehuaSignIn(_PluginBase):
         :return: 执行结果
         """
         if not self._forum_enabled:
-            return {"success": False, "message": "论坛浏览未启用"}
+            return self._envelope(False, "论坛浏览未启用")
         state = {
             "view": view if view in ("index", "forum", "thread") else "index",
             "fid": str(fid or ""),
@@ -417,13 +432,13 @@ class SehuaSignIn(_PluginBase):
             state["view"] = "forum" if state["fid"] else "index"
         self._save_nav_state(state)
         try:
-            self._load_view(state, refresh=bool(refresh))
-            return {"success": True, "message": ""}
+            view_data = self._load_view(state, refresh=bool(refresh))
+            return self._envelope(True, "", view_data)
         except SehuaForumError as error:
-            return {"success": False, "message": str(error)}
+            return self._envelope(False, str(error))
         except Exception as error:  # noqa: BLE001 - 统一返回可读错误
             logger.error(f"【98堂浏览】读取失败：{error}")
-            return {"success": False, "message": f"读取失败：{error}"}
+            return self._envelope(False, f"读取失败：{error}")
 
     async def api_reply(self, request: Request) -> HTMLResponse:
         """提交帖子回复并返回可自动关闭的结果页。
