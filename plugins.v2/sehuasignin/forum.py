@@ -19,8 +19,11 @@ AGE_GATE_TEXTS = ("请点此进入", "please click here", "点击进入")
 MAX_POST_CHARS = 4000
 # 帖子正文允许保留的图片数量上限
 MAX_POST_IMAGES = 30
-# 原图地址的匹配规则（Discuz 正文中的 img 标签）
-IMG_SRC_PATTERN = re.compile(r'<img[^>]+src\s*=\s*["\']([^"\']+)["\'][^>]*>', re.I)
+# 正文中的 img 标签，以及标签内的属性（Discuz 的图片地址常写在 file / zoomfile 上）
+IMG_TAG_PATTERN = re.compile(r"<img\b[^>]*>", re.I)
+IMG_ATTR_PATTERN = re.compile(r"""([\w-]+)\s*=\s*["']([^"']*)["']""")
+# 取图时依次尝试的属性名
+IMG_URL_ATTRS = ("file", "zoomfile", "src")
 
 
 class SehuaForumError(Exception):
@@ -30,17 +33,27 @@ class SehuaForumError(Exception):
 def extract_image_urls(raw: str, limit: int = MAX_POST_IMAGES) -> List[str]:
     """提取帖子正文中的图片地址。
 
+    Discuz 的图片标签把真实地址写在 ``file``/``zoomfile`` 属性上，``src`` 往往
+    是占位或为空（实测图集帖约九成如此），因此按 file → zoomfile → src 的顺序取值。
+
     :param raw: 帖子正文 HTML 片段
     :param limit: 最多返回的图片数量
     :return: 图片地址列表（按出现顺序去重）
     """
     urls: List[str] = []
-    for matched in IMG_SRC_PATTERN.findall(raw or ""):
-        url = html_lib.unescape(matched).strip()
-        if not url or url.startswith(("static/", "/static/", "data:")):
+    for tag in IMG_TAG_PATTERN.findall(raw or ""):
+        attrs = {key.lower(): value for key, value in IMG_ATTR_PATTERN.findall(tag)}
+        candidate = ""
+        for key in IMG_URL_ATTRS:
+            value = html_lib.unescape(attrs.get(key) or "").strip()
+            if value.startswith("//"):
+                value = "https:" + value
+            if value.startswith(("http://", "https://")):
+                candidate = value
+                break
+        if not candidate or candidate in urls:
             continue
-        if url not in urls:
-            urls.append(url)
+        urls.append(candidate)
         if len(urls) >= limit:
             break
     return urls
