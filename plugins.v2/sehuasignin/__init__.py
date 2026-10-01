@@ -33,7 +33,7 @@ class SehuaSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     # 插件作者
     plugin_author = "local"
     # 插件配置项ID前缀
@@ -224,13 +224,20 @@ class SehuaSignIn(_PluginBase):
             return self._forum
 
     def _nav_state(self) -> Dict[str, Any]:
-        """读取当前浏览位置。
+        """读取当前浏览位置，长时间未操作时回到板块列表。
 
         :return: 浏览状态字典
         """
         state = self.get_data("nav") or {}
+        view = str(state.get("view") or "index")
+        # 距上次浏览超过一定时间视为新一次访问，回到板块列表
+        last = float(state.get("time") or 0)
+        if last and datetime.now().timestamp() - last > 1800:
+            view = "index"
+        if view not in ("index", "forum", "thread"):
+            view = "index"
         return {
-            "view": str(state.get("view") or "index"),
+            "view": view,
             "fid": str(state.get("fid") or ""),
             "page": max(1, int(state.get("page") or 1)),
             "tid": str(state.get("tid") or ""),
@@ -242,7 +249,9 @@ class SehuaSignIn(_PluginBase):
 
         :param state: 浏览状态字典
         """
-        self.save_data("nav", state)
+        payload = dict(state)
+        payload["time"] = datetime.now().timestamp()
+        self.save_data("nav", payload)
 
     def _cached_view(self, key: str) -> Optional[Dict[str, Any]]:
         """读取浏览缓存。
@@ -896,7 +905,12 @@ class SehuaSignIn(_PluginBase):
                 for board in (data.get("boards") or [])
             ]
             body = [
-                {"component": "VCardTitle", "props": {"text": f"板块列表（{len(items)}）"}},
+                {
+                    "component": "VCardText",
+                    "props": {"class": "pt-0 pb-0 text-caption text-medium-emphasis"},
+                    "text": "点击板块名称查看该板块的帖子列表",
+                },
+                {"component": "VCardTitle", "props": {"text": f"全部板块（{len(items)}）"}},
                 {"component": "VList", "props": {"density": "compact"}, "content": items},
             ]
         elif view == "forum":
@@ -925,6 +939,11 @@ class SehuaSignIn(_PluginBase):
                 for thread in threads
             ]
             body = [
+                {
+                    "component": "VCardText",
+                    "props": {"class": "pt-0 pb-0 text-caption text-medium-emphasis"},
+                    "text": "点击帖子标题查看内容；使用下方按钮翻页",
+                },
                 {
                     "component": "VCardTitle",
                     "props": {
@@ -1023,6 +1042,13 @@ class SehuaSignIn(_PluginBase):
                 "page": state["page"],
             }
             buttons.append(button("返回上一级", target, "mdi-arrow-left"))
+        if view == "thread":
+            buttons.append(
+                button("返回板块帖子列表", {"view": "forum", "fid": state["fid"], "page": state["page"]},
+                       "mdi-format-list-bulleted")
+            )
+        if view != "index":
+            buttons.append(button("全部板块", {"view": "index"}, "mdi-view-grid-outline"))
         buttons.append(button("刷新", {"view": view, "fid": state["fid"], "tid": state["tid"],
                                        "page": state["page"], "tpage": state["tpage"],
                                        "refresh": 1}, "mdi-refresh"))
