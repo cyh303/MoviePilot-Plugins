@@ -6,9 +6,12 @@
 """
 
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
 import pytz
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import Request
@@ -28,6 +31,15 @@ _FORUM_SESSIONS: Dict[str, SehuaForumSession] = {}
 _FORUM_SESSIONS_LOCK = threading.Lock()
 
 
+# 图片有效性校验结果的缓存（避免每次翻页都重复探测）
+_IMAGE_CHECK_CACHE: Dict[str, tuple] = {}
+_IMAGE_CHECK_LOCK = threading.Lock()
+# 校验结果缓存时长（秒）
+_IMAGE_CHECK_TTL = 1800
+# 单次校验的最大并发
+_IMAGE_CHECK_WORKERS = 6
+
+
 class SehuaSignIn(_PluginBase):
     """98堂（色花堂）论坛每日自动签到插件。"""
 
@@ -38,7 +50,7 @@ class SehuaSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.4.2"
+    plugin_version = "1.5.0"
     # 插件作者
     plugin_author = "local"
     # 插件配置项ID前缀
@@ -554,8 +566,6 @@ class SehuaSignIn(_PluginBase):
         :param url: 原始图片地址
         :return: 图片响应
         """
-        import httpx
-
         target = (url or "").strip()
         if not target:
             return Response(status_code=400, content="缺少图片地址")
@@ -1255,32 +1265,34 @@ class SehuaSignIn(_PluginBase):
             {
                 "component": "div",
                 "props": {"style": "white-space: pre-wrap;"},
-                "text": post.get("content") or "（无正文内容）",
+                "text": post.get("content")
+                or ("（本层为图片内容）" if post.get("images") else "（无正文内容）"),
             }
         ]
 
         images = list(post.get("images") or []) if self._forum_show_images else []
         if images:
-            shown = images[: self._forum_max_images]
+            alive = self._filter_alive_images(images[: self._forum_max_images * 2])
+            shown = alive[: self._forum_max_images]
+            skipped = len(images) - len(shown)
+            caption = f"图片 {len(images)} 张"
+            if skipped:
+                caption += f"（显示 {len(shown)} 张，其余源站已失效或超出上限）"
             content.append(
                 {
                     "component": "div",
                     "props": {"class": "text-caption text-medium-emphasis mt-2"},
-                    "text": f"图片 {len(images)} 张"
-                    + (
-                        f"（仅显示前 {len(shown)} 张）"
-                        if len(images) > len(shown)
-                        else ""
-                    ),
+                    "text": caption,
                 }
             )
-            content.append(
-                {
-                    "component": "div",
-                    "props": {},
-                    "html": self._images_html(shown),
-                }
-            )
+            if shown:
+                content.append(
+                    {
+                        "component": "div",
+                        "props": {},
+                        "html": self._images_html(shown),
+                    }
+                )
 
         return {
             "component": "VCard",
@@ -1452,6 +1464,63 @@ class SehuaSignIn(_PluginBase):
                 "content": controls,
             }
         ]
+
+    def _filter_alive_images(self, images: List[str]) -> List[str]:
+        """过滤掉源头已失效的图片，避免页面出现空白占位。
+
+        站点部分老帖的图床已经下线，渲染出来只会是空白，因此先并发探测一次；结果会
+        缓存一段时间，翻页时不会重复请求。
+
+        :param images: 候选图片地址
+        :return: 可访问的图片地址（保持原顺序）
+        """
+        if not images:
+            return []
+        now = time.time()
+        alive: List[str] = []
+        pending: List[str] = []
+        with _IMAGE_CHECK_LOCK:
+            for url in images:
+                cached = _IMAGE_CHECK_CACHE.get(url)
+                if cached and now - cached[0] < _IMAGE_CHECK_TTL:
+                    if cached[1]:
+                        alive.append(url)
+                else:
+                    pending.append(url)
+
+        if not pending:
+            return alive
+
+        results: Dict[str, bool] = {}
+
+        def probe(url: str) -> bool:
+            """探测单个图片地址是否可用。
+
+            :param url: 图片地址
+            :return: 可用返回 True
+            """
+            try:
+                with httpx.Client(timeout=10, follow_redirects=True) as client:
+                    response = client.get(url, headers={"Referer": self._site_url + "/"})
+                return response.status_code == 200 and (
+                    response.headers.get("content-type", "").lower().startswith("image/")
+                )
+            except Exception:  # noqa: BLE001 - 探测失败按不可用处理
+                return False
+
+        with ThreadPoolExecutor(max_workers=_IMAGE_CHECK_WORKERS) as pool:
+            for url, ok in zip(pending, pool.map(probe, pending)):
+                results[url] = ok
+
+        with _IMAGE_CHECK_LOCK:
+            for url, ok in results.items():
+                _IMAGE_CHECK_CACHE[url] = (now, ok)
+
+        for url in images:
+            if results.get(url) or (url in alive):
+                if url not in alive:
+                    alive.append(url)
+        return alive
 
     def _reply_form(self, state: Dict[str, Any], data: Dict[str, Any]) -> dict:
         """构建回复表单，使用同页内嵌框提交，避免跳转外部浏览器。
