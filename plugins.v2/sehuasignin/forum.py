@@ -72,16 +72,48 @@ def list_driver_pids() -> set:
     return pids
 
 
-def terminate_pids(pids) -> None:
-    """终止指定 PID 的进程（用于回收遗留的浏览器进程）。
+def _pid_alive(pid: int) -> bool:
+    """判断进程是否仍然存在。
+
+    :param pid: 进程号
+    :return: 进程存在返回 True
+    """
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+def terminate_pids(pids, grace_seconds: float = 8.0) -> None:
+    """终止指定 PID 的进程，先温和再强制。
+
+    浏览器进程在异常状态下可能忽略终止信号，因此先发送 SIGTERM，等待一段时间后
+    对仍然存活的进程发送 SIGKILL。
 
     :param pids: 待终止的 PID 集合
+    :param grace_seconds: 发送 SIGKILL 前的等待秒数
     """
     import signal
 
-    for pid in pids:
+    targets = [int(pid) for pid in pids if pid]
+    alive = [pid for pid in targets if _pid_alive(pid)]
+    if not alive:
+        return
+    for pid in alive:
         try:
-            os.kill(int(pid), signal.SIGTERM)
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+    deadline = time.time() + max(0.0, float(grace_seconds))
+    while time.time() < deadline:
+        alive = [pid for pid in alive if _pid_alive(pid)]
+        if not alive:
+            return
+        time.sleep(0.5)
+    for pid in alive:
+        try:
+            os.kill(pid, signal.SIGKILL)
         except OSError:
             continue
 
