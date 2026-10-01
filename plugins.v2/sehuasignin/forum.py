@@ -6,9 +6,11 @@
 
 import html as html_lib
 import importlib
+import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # 站点年龄确认页的进入按钮文案
@@ -46,6 +48,44 @@ def html_to_text(raw: str) -> str:
     return text
 
 
+def list_driver_pids() -> set:
+    """列出系统中所有 playwright driver 进程的 PID。
+
+    直接读取 /proc，避免引入额外依赖；读取失败时返回空集合。
+
+    :return: playwright driver 进程 PID 集合
+    """
+    pids: set = set()
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/cmdline", "rb") as handle:
+                    cmdline = handle.read().replace(b"\x00", b" ").decode("utf-8", "ignore")
+            except OSError:
+                continue
+            if "playwright" in cmdline and "driver" in cmdline:
+                pids.add(int(entry))
+    except OSError:
+        return set()
+    return pids
+
+
+def terminate_pids(pids) -> None:
+    """终止指定 PID 的进程（用于回收遗留的浏览器进程）。
+
+    :param pids: 待终止的 PID 集合
+    """
+    import signal
+
+    for pid in pids:
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except OSError:
+            continue
+
+
 class SehuaForumSession:
     """可复用的论坛会话，负责登录、浏览与回复。"""
 
@@ -66,6 +106,7 @@ class SehuaForumSession:
         timeout: int = 60,
         idle_seconds: int = 600,
         log: Optional[Callable[[str], None]] = None,
+        on_driver: Optional[Callable[[List[int]], None]] = None,
     ) -> None:
         """初始化论坛会话参数。
 
@@ -79,6 +120,7 @@ class SehuaForumSession:
         :param timeout: 页面超时秒数
         :param idle_seconds: 会话空闲回收秒数
         :param log: 日志输出回调
+        :param on_driver: 浏览器启动后回报 driver 进程 PID 的回调
         """
         self.site_url = (site_url or "").strip().rstrip("/")
         self.username = (username or "").strip()
@@ -90,6 +132,7 @@ class SehuaForumSession:
         self.timeout = max(20, int(timeout or 60))
         self.idle_seconds = max(60, int(idle_seconds or 600))
         self._log = log
+        self._on_driver = on_driver
 
         self._lock = threading.RLock()
         self._context: Any = None
@@ -98,6 +141,10 @@ class SehuaForumSession:
         self._last_used = 0.0
         self._reaper: Optional[threading.Thread] = None
         self._closed = True
+        # 同步版 Playwright 只能在其创建线程中使用，因此所有浏览器操作都放进这条独占线程执行
+        self._executor: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="SehuaForum"
+        )
 
     # ------------------------------------------------------------------ 基础
     def _log_info(self, message: str) -> None:
@@ -117,6 +164,25 @@ class SehuaForumSession:
         )
         self._reaper.start()
 
+    def _run(self, func: Callable[[], Any], timeout: float = 180.0) -> Any:
+        """在专属工作线程中执行浏览器操作。
+
+        同步版 Playwright 不允许在 asyncio 事件循环中调用，且其对象只能在创建线程
+        中使用，因此统一派发到独占线程执行。
+
+        :param func: 待执行的无参可调用对象
+        :param timeout: 等待超时秒数
+        :return: func 的返回值
+        """
+        executor = self._executor
+        if executor is None:
+            raise SehuaForumError("浏览会话已关闭")
+        future = executor.submit(func)
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeout as error:
+            raise SehuaForumError(f"浏览器操作超时（{int(timeout)} 秒）") from error
+
     def _reap_loop(self) -> None:
         """周期检查并回收空闲过久的会话。"""
         while True:
@@ -127,40 +193,67 @@ class SehuaForumSession:
                         return
                     if time.monotonic() - self._last_used > self.idle_seconds:
                         self._log_info("浏览会话空闲超时，已回收浏览器")
-                        self._close_locked()
+                        try:
+                            self._run(self._close_locked, timeout=30)
+                        except SehuaForumError:
+                            pass
                         return
             except Exception:  # noqa: BLE001 - 回收异常不应影响主流程
                 return
 
     def _close_locked(self) -> None:
-        """在已持锁的情况下关闭浏览器会话。"""
-        try:
-            if self._context is not None:
-                self._context.close()
-        except Exception:  # noqa: BLE001 - 关闭失败不影响后续重建
-            pass
+        """在专属线程中关闭浏览器会话。
+
+        该方法只能在 ``_run`` 派发的工作线程内执行，保证与浏览器对象同线程。
+        """
+        context = self._context
         self._context = None
         self._page = None
         self._logged_in = False
         self._closed = True
+        if context is None:
+            return
+        try:
+            context.close()
+        except Exception:  # noqa: BLE001 - 关闭失败不影响后续重建
+            pass
 
     def close(self) -> None:
         """关闭浏览器会话并释放资源。"""
         with self._lock:
-            self._close_locked()
+            try:
+                self._run(self._close_locked, timeout=25)
+            except SehuaForumError:
+                self._log_info("关闭浏览会话超时，已放弃等待")
+            executor = self._executor
+            self._executor = None
+            if executor is not None:
+                executor.shutdown(wait=False)
 
     # ------------------------------------------------------------------ 会话
     def _launch_locked(self) -> None:
-        """在已持锁的情况下启动浏览器并完成登录。"""
+        """启动浏览器并完成登录。
+
+        该方法只能在 ``_run`` 派发的工作线程内执行，保证与浏览器对象同线程。
+        """
         if self._context is not None and self._logged_in:
             return
         self._close_locked()
 
         cloakbrowser = importlib.import_module("cloakbrowser")
         self._log_info("启动浏览器并登录论坛")
+        # 记录启动前后的 driver 进程差异，用于后续识别并回收本插件遗留的浏览器
+        before = list_driver_pids()
         context = cloakbrowser.launch_context(
             headless=self.headless, proxy=self.proxy or None
         )
+        after = list_driver_pids()
+        new_pids = after - before
+        if new_pids and self._on_driver:
+            try:
+                self._on_driver(sorted(new_pids))
+            except Exception:  # noqa: BLE001 - 记录失败不影响会话使用
+                pass
         page = context.new_page()
         page.set_default_timeout(self.timeout * 1000)
         self._context = context
@@ -230,47 +323,32 @@ class SehuaForumSession:
             raise SehuaForumError("登录失败：账号或密码不正确")
         raise SehuaForumError(f"登录失败：{text[:100]}")
 
-    def _fetch_locked(self, url: str, retry: bool = True) -> str:
-        """在已持锁的情况下读取页面 HTML。
-
-        :param url: 目标地址
-        :param retry: 失败时是否重建会话后重试一次
-        :return: 页面 HTML
-        """
-        try:
-            self._launch_locked()
-            self._page.goto(url, wait_until="domcontentloaded", timeout=self.timeout * 1000)
-            time.sleep(2)
-            return self._page.content()
-        except Exception as error:  # noqa: BLE001 - 统一转为可重试流程
-            if not retry:
-                raise SehuaForumError(f"读取页面失败：{error}") from error
-            self._log_info(f"读取页面异常，重建会话后重试：{type(error).__name__}")
-            self._close_locked()
-            time.sleep(2)
-            return self._fetch_locked(url, retry=False)
-
     def _with_session(self, action: Callable[[Any], Any]) -> Any:
-        """在会话锁内执行一次浏览器操作。
+        """在独占工作线程中执行一次浏览器操作，必要时先建立会话。
 
         :param action: 接收页面对象并返回结果的可调用对象
         :return: action 的返回值
         """
         with self._lock:
             self._ensure_reaper()
-            try:
-                self._launch_locked()
-                return action(self._page)
-            except SehuaForumError:
-                raise
-            except Exception as error:  # noqa: BLE001 - 失败后重建会话重试一次
-                self._log_info(f"论坛操作异常，重建会话后重试：{type(error).__name__}")
-                self._close_locked()
-                time.sleep(2)
-                self._launch_locked()
-                return action(self._page)
-            finally:
-                self._last_used = time.monotonic()
+
+            def job() -> Any:
+                """在工作线程内完成会话准备、执行与失败重试。"""
+                try:
+                    self._launch_locked()
+                    return action(self._page)
+                except SehuaForumError:
+                    raise
+                except Exception as error:  # noqa: BLE001 - 失败后重建会话重试一次
+                    self._log_info(f"论坛操作异常，重建会话后重试：{type(error).__name__}")
+                    self._close_locked()
+                    time.sleep(2)
+                    self._launch_locked()
+                    return action(self._page)
+                finally:
+                    self._last_used = time.monotonic()
+
+            return self._run(job, timeout=max(180.0, float(self.timeout) * 3))
 
     def _goto_html(self, page: Any, url: str) -> str:
         """在当前会话中打开页面并返回 HTML。
