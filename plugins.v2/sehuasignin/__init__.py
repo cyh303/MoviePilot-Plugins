@@ -7,7 +7,6 @@
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,13 +30,19 @@ _FORUM_SESSIONS: Dict[str, SehuaForumSession] = {}
 _FORUM_SESSIONS_LOCK = threading.Lock()
 
 
-# 图片有效性校验结果的缓存（避免每次翻页都重复探测）
-_IMAGE_CHECK_CACHE: Dict[str, tuple] = {}
-_IMAGE_CHECK_LOCK = threading.Lock()
-# 校验结果缓存时长（秒）
-_IMAGE_CHECK_TTL = 1800
-# 单次校验的最大并发
-_IMAGE_CHECK_WORKERS = 6
+# 缓存与并发控制
+_IMAGE_CACHE_TTL = 1800
+# 图片压缩后的最大宽度与高度
+_IMAGE_MAX_WIDTH = 1080
+_IMAGE_MAX_HEIGHT = 1440
+# 小于该体积的图片无需压缩
+_IMAGE_SHRINK_THRESHOLD = 150 * 1024
+# 压缩结果缓存（地址 -> (时间, 字节, MIME)），避免重复占用 CPU
+_IMAGE_BLOB_CACHE: Dict[str, tuple] = {}
+_IMAGE_BLOB_LIMIT = 40
+_IMAGE_BLOB_LOCK = threading.Lock()
+# 同时抓取的图片数量上限，避免一次渲染把 CPU 与网络占满
+_IMAGE_FETCH_SLOTS = threading.Semaphore(4)
 
 
 class SehuaSignIn(_PluginBase):
@@ -50,7 +55,7 @@ class SehuaSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.5.0"
+    plugin_version = "1.6.2"
     # 插件作者
     plugin_author = "local"
     # 插件配置项ID前缀
@@ -573,24 +578,53 @@ class SehuaSignIn(_PluginBase):
             logger.warn(f"【98堂浏览】已拒绝不安全的图片地址：{target[:120]}")
             return Response(status_code=400, content="图片地址不受支持")
 
+        now = time.time()
+        with _IMAGE_BLOB_LOCK:
+            cached = _IMAGE_BLOB_CACHE.get(target)
+        if cached and now - cached[0] < _IMAGE_CACHE_TTL:
+            data, mime = cached[1], cached[2]
+            return Response(
+                content=data,
+                media_type=mime,
+                headers={"Cache-Control": "public, max-age=3600"},
+            )
+
+        headers = {
+            "Referer": self._site_url + "/",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/139.0.0.0 Safari/537.36"
+            ),
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        }
         try:
-            with httpx.Client(timeout=20, follow_redirects=True) as client:
-                response = client.get(
-                    target,
-                    headers={
-                        "Referer": self._site_url + "/",
-                        "User-Agent": (
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/139.0.0.0 Safari/537.36"
-                        ),
-                        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-                    },
-                )
-            if response.status_code != 200:
-                logger.warn(
-                    f"【98堂浏览】图片抓取失败 {response.status_code}：{target[:120]}"
-                )
+            response = None
+            # 图床的 IPv6 连接经常长时间挂起，因此收紧连接超时并多次重试，
+            # 只要有一次连上 IPv4 就能很快取回图片。并发槽位限制避免一次渲染
+            # 同时抓取过多图片，把 CPU 与出口带宽占满。
+            timeout = httpx.Timeout(connect=3.0, read=25.0, write=10.0, pool=3.0)
+            acquired = _IMAGE_FETCH_SLOTS.acquire(timeout=30)
+            try:
+                for attempt in range(4):
+                    try:
+                        with httpx.Client(
+                            timeout=timeout, follow_redirects=True
+                        ) as client:
+                            response = client.get(target, headers=headers)
+                        break
+                    except Exception as error:  # noqa: BLE001 - 失败后重试
+                        if attempt == 3:
+                            raise
+                        logger.warn(
+                            f"【98堂浏览】图片抓取第 {attempt + 1} 次失败，重试：{error}"
+                        )
+            finally:
+                if acquired:
+                    _IMAGE_FETCH_SLOTS.release()
+            if response is None or response.status_code != 200:
+                code = response.status_code if response else "N/A"
+                logger.warn(f"【98堂浏览】图片抓取失败 {code}：{target[:120]}")
                 return Response(status_code=502, content="图片抓取失败")
 
             content_type = (response.headers.get("content-type") or "").lower()
@@ -601,9 +635,16 @@ class SehuaSignIn(_PluginBase):
             data = response.content
             if not data:
                 return Response(status_code=502, content="图片内容为空")
+            data, content_type = self._shrink_image(data, content_type)
+            mime = content_type.split(";")[0].strip()
+            with _IMAGE_BLOB_LOCK:
+                if len(_IMAGE_BLOB_CACHE) >= _IMAGE_BLOB_LIMIT:
+                    oldest = min(_IMAGE_BLOB_CACHE, key=lambda key: _IMAGE_BLOB_CACHE[key][0])
+                    _IMAGE_BLOB_CACHE.pop(oldest, None)
+                _IMAGE_BLOB_CACHE[target] = (now, data, mime)
             return Response(
                 content=data,
-                media_type=content_type.split(";")[0].strip(),
+                media_type=mime,
                 headers={"Cache-Control": "public, max-age=3600"},
             )
         except Exception as error:  # noqa: BLE001 - 统一转为可读错误
@@ -1272,12 +1313,10 @@ class SehuaSignIn(_PluginBase):
 
         images = list(post.get("images") or []) if self._forum_show_images else []
         if images:
-            alive = self._filter_alive_images(images[: self._forum_max_images * 2])
-            shown = alive[: self._forum_max_images]
-            skipped = len(images) - len(shown)
+            shown = images[: self._forum_max_images]
             caption = f"图片 {len(images)} 张"
-            if skipped:
-                caption += f"（显示 {len(shown)} 张，其余源站已失效或超出上限）"
+            if len(images) > len(shown):
+                caption += f"（仅显示前 {len(shown)} 张）"
             content.append(
                 {
                     "component": "div",
@@ -1285,14 +1324,13 @@ class SehuaSignIn(_PluginBase):
                     "text": caption,
                 }
             )
-            if shown:
-                content.append(
-                    {
-                        "component": "div",
-                        "props": {},
-                        "html": self._images_html(shown),
-                    }
-                )
+            content.append(
+                {
+                    "component": "div",
+                    "props": {},
+                    "html": self._images_html(shown),
+                }
+            )
 
         return {
             "component": "VCard",
@@ -1465,62 +1503,35 @@ class SehuaSignIn(_PluginBase):
             }
         ]
 
-    def _filter_alive_images(self, images: List[str]) -> List[str]:
-        """过滤掉源头已失效的图片，避免页面出现空白占位。
+    @staticmethod
+    def _shrink_image(data: bytes, content_type: str) -> Tuple[bytes, str]:
+        """压缩图片，降低浏览时的传输与解码开销。
 
-        站点部分老帖的图床已经下线，渲染出来只会是空白，因此先并发探测一次；结果会
-        缓存一段时间，翻页时不会重复请求。
+        图床原图常有 1MB 以上，一次渲染多张会让页面长时间空白，因此在服务端先缩到
+        适合阅读的尺寸并转成 JPEG。任何异常都退回原图。
 
-        :param images: 候选图片地址
-        :return: 可访问的图片地址（保持原顺序）
+        :param data: 原始图片字节
+        :param content_type: 原始 MIME 类型
+        :return: 处理后的字节与 MIME 类型
         """
-        if not images:
-            return []
-        now = time.time()
-        alive: List[str] = []
-        pending: List[str] = []
-        with _IMAGE_CHECK_LOCK:
-            for url in images:
-                cached = _IMAGE_CHECK_CACHE.get(url)
-                if cached and now - cached[0] < _IMAGE_CHECK_TTL:
-                    if cached[1]:
-                        alive.append(url)
-                else:
-                    pending.append(url)
+        if len(data) <= _IMAGE_SHRINK_THRESHOLD:
+            return data, content_type
+        try:
+            import io
 
-        if not pending:
-            return alive
+            from PIL import Image
 
-        results: Dict[str, bool] = {}
-
-        def probe(url: str) -> bool:
-            """探测单个图片地址是否可用。
-
-            :param url: 图片地址
-            :return: 可用返回 True
-            """
-            try:
-                with httpx.Client(timeout=10, follow_redirects=True) as client:
-                    response = client.get(url, headers={"Referer": self._site_url + "/"})
-                return response.status_code == 200 and (
-                    response.headers.get("content-type", "").lower().startswith("image/")
-                )
-            except Exception:  # noqa: BLE001 - 探测失败按不可用处理
-                return False
-
-        with ThreadPoolExecutor(max_workers=_IMAGE_CHECK_WORKERS) as pool:
-            for url, ok in zip(pending, pool.map(probe, pending)):
-                results[url] = ok
-
-        with _IMAGE_CHECK_LOCK:
-            for url, ok in results.items():
-                _IMAGE_CHECK_CACHE[url] = (now, ok)
-
-        for url in images:
-            if results.get(url) or (url in alive):
-                if url not in alive:
-                    alive.append(url)
-        return alive
+            with Image.open(io.BytesIO(data)) as image:
+                image = image.convert("RGB")
+                image.thumbnail((_IMAGE_MAX_WIDTH, _IMAGE_MAX_HEIGHT), Image.LANCZOS)
+                buffer = io.BytesIO()
+                image.save(buffer, format="JPEG", quality=82, optimize=True)
+            shrunk = buffer.getvalue()
+            if 0 < len(shrunk) < len(data):
+                return shrunk, "image/jpeg"
+        except Exception as error:  # noqa: BLE001 - 压缩失败时保留原图
+            logger.warn(f"【98堂浏览】图片压缩失败，改为返回原图：{error}")
+        return data, content_type
 
     def _reply_form(self, state: Dict[str, Any], data: Dict[str, Any]) -> dict:
         """构建回复表单，使用同页内嵌框提交，避免跳转外部浏览器。
