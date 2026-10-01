@@ -38,7 +38,7 @@ class SehuaSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.4.1"
+    plugin_version = "1.4.2"
     # 插件作者
     plugin_author = "local"
     # 插件配置项ID前缀
@@ -460,6 +460,33 @@ class SehuaSignIn(_PluginBase):
             return self._envelope(False, f"读取失败：{error}")
 
     # ------------------------------------------------------------ 图片代理
+    def _images_html(self, images: List[str]) -> str:
+        """生成楼层图片的 HTML 片段。
+
+        图片地址带查询参数，属性中需要转义 & 等字符；同时加入加载失败提示，
+        便于在网络异常时看清原因。
+
+        :param images: 原始图片地址列表
+        :return: HTML 片段
+        """
+        import html as html_lib
+
+        parts: List[str] = []
+        for image_url in images:
+            src = html_lib.escape(self._image_proxy_url(image_url), quote=True)
+            parts.append(
+                "<img "
+                f"src=\"{src}\" "
+                "style=\"display:block;max-width:100%;height:auto;margin:8px 0;"
+                "border-radius:6px;background:#f5f5f5\" "
+                "loading=\"lazy\" "
+                "referrerpolicy=\"no-referrer\" "
+                "onerror=\"this.style.display='none';"
+                "this.insertAdjacentHTML('afterend','<div style=\\'font-size:12px;color:#c62828\\'>"
+                "图片加载失败，可点击「刷新」重试</div>')\">"
+            )
+        return "".join(parts)
+
     def _image_proxy_url(self, image_url: str) -> str:
         """把原图地址转换为插件图片代理地址。
 
@@ -1247,20 +1274,13 @@ class SehuaSignIn(_PluginBase):
                     ),
                 }
             )
-            for image_url in shown:
-                content.append(
-                    {
-                        "component": "VImg",
-                        "props": {
-                            "src": self._image_proxy_url(image_url),
-                            "class": "my-2 rounded",
-                            "max-width": "100%",
-                            "max-height": "640",
-                            "contain": True,
-                            "loading": "lazy",
-                        },
-                    }
-                )
+            content.append(
+                {
+                    "component": "div",
+                    "props": {},
+                    "html": self._images_html(shown),
+                }
+            )
 
         return {
             "component": "VCard",
