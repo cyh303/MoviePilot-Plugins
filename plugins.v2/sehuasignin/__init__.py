@@ -38,7 +38,7 @@ class SehuaSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     # 插件作者
     plugin_author = "local"
     # 插件配置项ID前缀
@@ -632,24 +632,25 @@ class SehuaSignIn(_PluginBase):
 
     @staticmethod
     def _reply_page(success: bool, message: str) -> HTMLResponse:
-        """生成回复结果页面。
+        """生成回复结果页面，供同页内嵌框展示。
 
         :param success: 是否成功
         :param message: 结果说明
-        :return: 自动关闭的结果页
+        :return: 内嵌框结果页
         """
         color = "#2e7d32" if success else "#c62828"
         title = "回复成功" if success else "回复未成功"
         body = (
             f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            f"<meta name='viewport' content='width=device-width, initial-scale=1'>"
             f"<title>{title}</title></head>"
-            f"<body style=\"font-family:system-ui,-apple-system,'Segoe UI',sans-serif;"
-            f"padding:28px;line-height:1.7;color:#333\">"
-            f"<h3 style='color:{color};margin:0 0 12px'>{title}</h3>"
-            f"<div style='color:#555'>{message}</div>"
-            f"<p style='color:#888;font-size:13px;margin-top:20px'>本页将在 3 秒后自动关闭，"
-            f"请在插件页面点击「刷新」查看最新内容。</p>"
-            f"<script>setTimeout(function(){{window.close();}},3000);</script>"
+            f"<body style=\"margin:0;padding:12px 14px;"
+            f"font-family:system-ui,-apple-system,'Segoe UI',sans-serif;"
+            f"line-height:1.6;color:#333;background:transparent\">"
+            f"<div style='color:{color};font-weight:600;margin-bottom:4px'>{title}</div>"
+            f"<div style='color:#555;font-size:13px'>{message}</div>"
+            f"<div style='color:#888;font-size:12px;margin-top:8px'>"
+            f"如需查看最新楼层，请点击上方「刷新」</div>"
             f"</body></html>"
         )
         return HTMLResponse(content=body)
@@ -1433,7 +1434,7 @@ class SehuaSignIn(_PluginBase):
         ]
 
     def _reply_form(self, state: Dict[str, Any], data: Dict[str, Any]) -> dict:
-        """构建回复表单，使用原生表单提交以便直接输入内容。
+        """构建回复表单，使用同页内嵌框提交，避免跳转外部浏览器。
 
         :param state: 浏览状态
         :param data: 当前帖子数据
@@ -1446,8 +1447,9 @@ class SehuaSignIn(_PluginBase):
         )
         action = f"{domain}?apikey={token}"
         fid = data.get("fid") or state.get("fid") or ""
+        frame_name = f"sehua-reply-{data.get('tid') or state['tid']}"
         html = (
-            "<form method='post' target='_blank' "
+            f"<form method='post' target='{frame_name}' "
             f"action=\"{action}\" style='margin-top:8px'>"
             f"<input type='hidden' name='tid' value='{data.get('tid') or state['tid']}'>"
             f"<input type='hidden' name='fid' value='{fid}'>"
@@ -1458,7 +1460,12 @@ class SehuaSignIn(_PluginBase):
             "<button type='submit' style='margin-top:8px;padding:8px 18px;border:none;"
             "border-radius:6px;background:#1976d2;color:#fff;font-size:14px;cursor:pointer'>"
             "发送回复</button>"
+            "<button type='reset' style='margin:8px 0 0 8px;padding:8px 14px;border:1px solid #ccc;"
+            "border-radius:6px;background:transparent;font-size:14px;cursor:pointer'>清空</button>"
             "</form>"
+            f"<iframe name='{frame_name}' title='回复结果' "
+            "style='width:100%;height:118px;border:1px dashed #d0d0d0;border-radius:6px;"
+            "margin-top:8px;background:transparent'></iframe>"
         )
         return {
             "component": "VCardText",
@@ -1466,7 +1473,7 @@ class SehuaSignIn(_PluginBase):
                 {
                     "component": "div",
                     "props": {"class": "text-caption text-medium-emphasis mb-1"},
-                    "text": "发表回复（提交后请点击上方「刷新」查看结果）",
+                    "text": "发表回复：结果会显示在下方框内，发送后点击上方「刷新」查看最新楼层",
                 },
                 {"component": "div", "props": {}, "html": html},
             ],
