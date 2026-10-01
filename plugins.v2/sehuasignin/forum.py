@@ -55,8 +55,8 @@ def html_to_text(raw: str) -> str:
     if not raw:
         return ""
     text = raw
-    # 图片等替换为占位标记，便于用户判断内容构成
-    text = re.sub(r"<img[^>]*>", " [图片] ", text, flags=re.I)
+    # 图片由前端单独渲染，这里只去掉标签，避免出现多余的文字占位
+    text = re.sub(r"<img[^>]*>", "", text, flags=re.I)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
     text = re.sub(r"</(p|div|tr|li|h\d)>", "\n", text, flags=re.I)
     text = re.sub(r"<script.*?</script>", "", text, flags=re.S | re.I)
