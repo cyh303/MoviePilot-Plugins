@@ -9,6 +9,7 @@ import base64
 import importlib
 import io
 import json
+import os
 import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -31,6 +32,76 @@ AGE_GATE_TEXTS = ("请点此进入", "please click here", "点击进入")
 
 class SehuaSignError(Exception):
     """签到流程中可直接呈现给用户的异常。"""
+
+
+def scan_driver_pids() -> set:
+    """列出系统中所有 playwright driver 进程的 PID。
+
+    直接读取 /proc，避免引入额外依赖；读取失败时返回空集合。
+
+    :return: playwright driver 进程 PID 集合
+    """
+    pids: set = set()
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/cmdline", "rb") as handle:
+                    cmdline = handle.read().replace(b"\x00", b" ").decode("utf-8", "ignore")
+            except OSError:
+                continue
+            if "playwright" in cmdline and "driver" in cmdline:
+                pids.add(int(entry))
+    except OSError:
+        return set()
+    return pids
+
+
+def _pid_alive(pid: int) -> bool:
+    """判断进程是否仍然存在。
+
+    :param pid: 进程号
+    :return: 进程存在返回 True
+    """
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+def terminate_pids(pids, grace_seconds: float = 8.0) -> None:
+    """终止指定 PID 的进程，先温和再强制。
+
+    浏览器进程在异常状态下可能忽略终止信号，因此先发送 SIGTERM，等待一段时间后
+    对仍然存活的进程发送 SIGKILL。
+
+    :param pids: 待终止的 PID 集合
+    :param grace_seconds: 发送 SIGKILL 前的等待秒数
+    """
+    import signal
+
+    targets = [int(pid) for pid in pids if pid]
+    alive = [pid for pid in targets if _pid_alive(pid)]
+    if not alive:
+        return
+    for pid in alive:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+    deadline = time.time() + max(0.0, float(grace_seconds))
+    while time.time() < deadline:
+        alive = [pid for pid in alive if _pid_alive(pid)]
+        if not alive:
+            return
+        time.sleep(0.5)
+    for pid in alive:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            continue
 
 
 def _decode_image(image_b64: str) -> Any:
@@ -149,6 +220,7 @@ class SehuaSigner:
         headless: bool = True,
         timeout: int = 60,
         log: Optional[Callable[[str], None]] = None,
+        on_driver: Optional[Callable[[Any], None]] = None,
     ) -> None:
         """初始化签到执行器。
 
@@ -163,6 +235,7 @@ class SehuaSigner:
         :param headless: 是否使用无头浏览器
         :param timeout: 页面与请求超时秒数
         :param log: 日志输出回调
+        :param on_driver: 浏览器启动后回调，用于回报新增的 driver 进程 PID
         """
         self.site_url = (site_url or "").strip().rstrip("/")
         self.username = (username or "").strip()
@@ -175,6 +248,7 @@ class SehuaSigner:
         self.headless = bool(headless)
         self.timeout = max(20, int(timeout or 60))
         self._log = log
+        self._on_driver = on_driver
 
     def _log_info(self, message: str) -> None:
         """输出流程日志。
@@ -200,10 +274,17 @@ class SehuaSigner:
         context = None
         try:
             self._log_info(f"启动浏览器访问 {self.site_url}")
+            known = scan_driver_pids()
             context = cloakbrowser.launch_context(
                 headless=self.headless,
                 proxy=self.proxy or None,
             )
+            # 回报本次新增的 driver 进程，便于插件重载后回收
+            if self._on_driver:
+                try:
+                    self._on_driver(sorted(scan_driver_pids() - known))
+                except Exception:  # noqa: BLE001 - 回报失败不影响签到
+                    pass
             page = context.new_page()
             page.set_default_timeout(self.timeout * 1000)
 
