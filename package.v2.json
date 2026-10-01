@@ -1,0 +1,15 @@
+{
+  "SehuaSignIn": {
+    "name": "98堂自动签到",
+    "description": "色花堂/98堂 Discuz 论坛每日自动签到，内嵌浏览器通过 Cloudflare 与年龄确认页，自动解答旋转验证码。",
+    "labels": "签到,站点",
+    "version": "1.0.0",
+    "icon": "world.png",
+    "author": "local",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0.0": "初始版本：内嵌浏览器通过 Cloudflare 校验与年龄确认页，账号密码加安全提问登录，自动解答旋转验证码完成每日签到；支持定时执行、手动运行、运行记录与通知。"
+    }
+  }
+}
