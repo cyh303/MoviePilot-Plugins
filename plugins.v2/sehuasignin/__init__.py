@@ -37,7 +37,7 @@ class SehuaSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.1.4"
+    plugin_version = "1.1.6"
     # 插件作者
     plugin_author = "local"
     # 插件配置项ID前缀
@@ -120,6 +120,12 @@ class SehuaSignIn(_PluginBase):
 
         # 回收上一次插件实例遗留的浏览器进程
         self._cleanup_orphan_browsers()
+        # 每次初始化都把浏览位置复位到板块列表，保证打开插件先看到全部板块
+        self.save_data(
+            "nav",
+            {"view": "index", "fid": "", "page": 1, "tid": "", "tpage": 1,
+             "time": datetime.now().timestamp()},
+        )
 
         if self._onlyonce and self._enabled:
             logger.info("【98堂签到】立即运行一次")
@@ -255,7 +261,7 @@ class SehuaSignIn(_PluginBase):
 
         插件重载会丢弃模块内的会话注册表，旧浏览器进程不再被引用；这里依据上次
         记录的 PID 将其关闭，避免长期占用内存。只会终止命令行确认为 playwright
-        driver 的进程。
+        driver 的进程，并在后台线程中执行以免拖慢插件加载。
         """
         try:
             recorded = self.get_data("forum_driver_pids") or []
@@ -269,7 +275,14 @@ class SehuaSignIn(_PluginBase):
         if not targets:
             return
         logger.info(f"【98堂浏览】回收上次遗留的浏览器进程：{sorted(targets)}")
-        terminate_pids(targets)
+
+        def _worker() -> None:
+            """在后台线程中回收遗留的浏览器进程。"""
+            terminate_pids(targets)
+
+        threading.Thread(
+            target=_worker, name="SehuaSignInCleanup", daemon=True
+        ).start()
 
     @staticmethod
     def close_forum_sessions() -> None:
