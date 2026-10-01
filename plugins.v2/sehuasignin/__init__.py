@@ -19,8 +19,12 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import MessageType
 
-from .forum import SehuaForumError, SehuaForumSession
+from .forum import SehuaForumError, SehuaForumSession, list_driver_pids, terminate_pids
 from .signer import QUESTION_CHOICES, SehuaSigner
+
+# 模块级论坛会话注册表：插件被重装或重建实例时复用同一个浏览器会话，避免残留占用内存
+_FORUM_SESSIONS: Dict[str, SehuaForumSession] = {}
+_FORUM_SESSIONS_LOCK = threading.Lock()
 
 
 class SehuaSignIn(_PluginBase):
@@ -33,7 +37,7 @@ class SehuaSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.4"
     # 插件作者
     plugin_author = "local"
     # 插件配置项ID前缀
@@ -66,9 +70,6 @@ class SehuaSignIn(_PluginBase):
     # 运行状态
     _running: bool = False
     _lock: Optional[threading.Lock] = None
-    _forum: Optional[SehuaForumSession] = None
-    _forum_lock: Optional[threading.Lock] = None
-    _forum_signature: str = ""
 
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态。
@@ -79,8 +80,6 @@ class SehuaSignIn(_PluginBase):
         self._running = False
         if self._lock is None:
             self._lock = threading.Lock()
-        if self._forum_lock is None:
-            self._forum_lock = threading.Lock()
 
         self._enabled = False
         self._notify = False
@@ -118,6 +117,9 @@ class SehuaSignIn(_PluginBase):
             self._forum_page_size = max(5, min(50, int(config.get("forum_page_size") or 20)))
             self._forum_idle_minutes = max(1, int(config.get("forum_idle_minutes") or 10))
             self._forum_allow_reply = bool(config.get("forum_allow_reply"))
+
+        # 回收上一次插件实例遗留的浏览器进程
+        self._cleanup_orphan_browsers()
 
         if self._onlyonce and self._enabled:
             logger.info("【98堂签到】立即运行一次")
@@ -188,12 +190,12 @@ class SehuaSignIn(_PluginBase):
         return {"success": success, "message": message}
 
     # ------------------------------------------------------------ 论坛浏览支持
-    def _forum_session(self) -> SehuaForumSession:
-        """获取论坛浏览会话，配置变化时自动重建。
+    def _forum_signature(self) -> str:
+        """计算当前论坛会话的配置指纹。
 
-        :return: 论坛会话对象
+        :return: 配置指纹字符串
         """
-        signature = "|".join(
+        return "|".join(
             [
                 self._site_url,
                 self._username,
@@ -203,12 +205,26 @@ class SehuaSignIn(_PluginBase):
                 str(self._forum_idle_minutes),
             ]
         )
-        assert self._forum_lock is not None
-        with self._forum_lock:
-            if self._forum is None or self._forum_signature != signature:
-                if self._forum is not None:
-                    self._forum.close()
-                self._forum = SehuaForumSession(
+
+    def _forum_session(self) -> SehuaForumSession:
+        """获取论坛浏览会话，配置变化时自动重建。
+
+        :return: 论坛会话对象
+        """
+        signature = self._forum_signature()
+        with _FORUM_SESSIONS_LOCK:
+            # 配置变化后关闭并清理所有旧会话，保证只保留一个浏览器
+            for old_signature in list(_FORUM_SESSIONS):
+                if old_signature == signature:
+                    continue
+                logger.info("【98堂浏览】配置已变化，关闭旧的浏览会话")
+                try:
+                    _FORUM_SESSIONS.pop(old_signature).close()
+                except Exception:  # noqa: BLE001 - 清理失败不影响新建会话
+                    pass
+            session = _FORUM_SESSIONS.get(signature)
+            if session is None:
+                session = SehuaForumSession(
                     site_url=self._site_url,
                     username=self._username,
                     password=self._password,
@@ -219,9 +235,51 @@ class SehuaSignIn(_PluginBase):
                     timeout=self._timeout,
                     idle_seconds=self._forum_idle_minutes * 60,
                     log=lambda message: logger.info(f"【98堂浏览】{message}"),
+                    on_driver=self._remember_driver,
                 )
-                self._forum_signature = signature
-            return self._forum
+                _FORUM_SESSIONS[signature] = session
+            return session
+
+    def _remember_driver(self, pids: Any) -> None:
+        """记录本次启动的浏览器进程 PID，便于插件重载后回收。
+
+        :param pids: 本次启动新增的 driver 进程 PID 列表
+        """
+        try:
+            self.save_data("forum_driver_pids", [int(pid) for pid in pids])
+        except Exception:  # noqa: BLE001 - 记录失败不影响浏览
+            pass
+
+    def _cleanup_orphan_browsers(self) -> None:
+        """回收上次插件实例遗留的浏览器进程。
+
+        插件重载会丢弃模块内的会话注册表，旧浏览器进程不再被引用；这里依据上次
+        记录的 PID 将其关闭，避免长期占用内存。只会终止命令行确认为 playwright
+        driver 的进程。
+        """
+        try:
+            recorded = self.get_data("forum_driver_pids") or []
+        except Exception:  # noqa: BLE001 - 读取失败时跳过清理
+            recorded = []
+        if not recorded:
+            return
+        alive = list_driver_pids()
+        targets = {int(pid) for pid in recorded if int(pid) in alive}
+        self.save_data("forum_driver_pids", [])
+        if not targets:
+            return
+        logger.info(f"【98堂浏览】回收上次遗留的浏览器进程：{sorted(targets)}")
+        terminate_pids(targets)
+
+    @staticmethod
+    def close_forum_sessions() -> None:
+        """关闭所有论坛浏览会话，释放浏览器进程。"""
+        with _FORUM_SESSIONS_LOCK:
+            for signature in list(_FORUM_SESSIONS):
+                try:
+                    _FORUM_SESSIONS.pop(signature).close()
+                except Exception:  # noqa: BLE001 - 释放失败不影响插件卸载
+                    pass
 
     def _nav_state(self) -> Dict[str, Any]:
         """读取当前浏览位置，长时间未操作时回到板块列表。
@@ -1164,12 +1222,7 @@ class SehuaSignIn(_PluginBase):
     def stop_service(self) -> None:
         """停止插件后台服务并释放资源。"""
         self._running = False
-        if self._forum is not None:
-            try:
-                self._forum.close()
-            except Exception:  # noqa: BLE001 - 释放失败不影响插件卸载
-                pass
-            self._forum = None
+        self.close_forum_sessions()
 
     def signin(self) -> Tuple[bool, str]:
         """执行一次签到并记录结果。
