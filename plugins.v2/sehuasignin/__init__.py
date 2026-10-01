@@ -37,7 +37,7 @@ class SehuaSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.2.1"
+    plugin_version = "1.3.0"
     # 插件作者
     plugin_author = "local"
     # 插件配置项ID前缀
@@ -367,10 +367,15 @@ class SehuaSignIn(_PluginBase):
     def _cache_key(state: Dict[str, Any]) -> str:
         """计算浏览状态的缓存键。
 
+        键中带有版本前缀，数据结构调整后旧缓存会自动失效。
+
         :param state: 浏览状态字典
         :return: 缓存键
         """
-        return f"{state['view']}:{state['fid']}:{state['page']}:{state['tid']}:{state['tpage']}"
+        return (
+            f"v2:{state['view']}:{state['fid']}:{state['page']}"
+            f":{state['tid']}:{state['tpage']}"
+        )
 
     def _load_view(self, state: Dict[str, Any], refresh: bool = False) -> Dict[str, Any]:
         """按浏览状态读取数据，必要时回源站点。
@@ -394,7 +399,7 @@ class SehuaSignIn(_PluginBase):
             if not data.get("fid"):
                 data["fid"] = state["fid"]
         else:
-            data = {"view": "index", "boards": session.list_boards()}
+            data = {"view": "index", "groups": session.list_boards()}
         self._store_view(key, data)
         return data
 
@@ -972,36 +977,19 @@ class SehuaSignIn(_PluginBase):
         ]
 
         if view == "index":
-            items = [
-                {
-                    "component": "VListItem",
-                    "props": {
-                        "title": board.get("name", ""),
-                        "subtitle": f"板块 ID {board.get('fid', '')}",
-                        "append-icon": "mdi-chevron-right",
-                    },
-                    "events": {
-                        "click": {
-                            "api": f"plugin/{self.__class__.__name__}/nav",
-                            "method": "get",
-                            "params": {
-                                "view": "forum",
-                                "fid": board.get("fid", ""),
-                                "page": 1,
-                                "apikey": settings.API_TOKEN,
-                            },
-                        }
-                    },
-                }
-                for board in (data.get("boards") or [])
-            ]
+            groups = data.get("groups") or []
+            items = self._group_items(groups)
+            board_total = sum(len(group.get("boards") or []) for group in groups)
             body = [
                 {
                     "component": "VCardText",
                     "props": {"class": "pt-0 pb-0 text-caption text-medium-emphasis"},
-                    "text": "点击板块名称查看该板块的帖子列表",
+                    "text": "按站点总目录分类，点击板块名称查看该板块的帖子列表",
                 },
-                {"component": "VCardTitle", "props": {"text": f"全部板块（{len(items)}）"}},
+                {
+                    "component": "VCardTitle",
+                    "props": {"text": f"全部板块（{board_total}，共 {len(groups)} 个总目录）"},
+                },
                 {"component": "VList", "props": {"density": "compact"}, "content": items},
             ]
         elif view == "forum":
@@ -1107,6 +1095,38 @@ class SehuaSignIn(_PluginBase):
             "method": "get",
             "params": payload,
         }
+
+    def _group_items(self, groups: List[Dict[str, Any]]) -> List[dict]:
+        """按站点总目录构建板块列表元素。
+
+        :param groups: 分组数据，元素包含 group 名称与 boards 列表
+        :return: 列表元素，包含分组标题与各板块项
+        """
+        items: List[dict] = []
+        for group in groups:
+            items.append(
+                {
+                    "component": "VListSubheader",
+                    "props": {"class": "text-subtitle-2 font-weight-bold text-primary"},
+                    "text": group.get("group") or "其它",
+                }
+            )
+            for board in group.get("boards") or []:
+                items.append(
+                    {
+                        "component": "VListItem",
+                        "props": {
+                            "title": board.get("name", ""),
+                            "append-icon": "mdi-chevron-right",
+                        },
+                        "events": {
+                            "click": self._nav_event(
+                                {"view": "forum", "fid": board.get("fid", ""), "page": 1}
+                            )
+                        },
+                    }
+                )
+        return items
 
     def _forum_nav_buttons(self, view: str, state: Dict[str, Any]) -> List[dict]:
         """构建论坛浏览顶部操作按钮。
