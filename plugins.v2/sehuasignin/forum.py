@@ -394,20 +394,74 @@ class SehuaForumSession:
         return page.content()
 
     # ------------------------------------------------------------------ 业务
-    def list_boards(self) -> List[Dict[str, str]]:
-        """获取论坛板块列表。
+    @staticmethod
+    def parse_boards(html: str) -> List[Dict[str, Any]]:
+        """从论坛首页解析「总目录 → 板块」的分组结构。
 
-        :return: 板块列表，元素包含 fid 与名称
+        :param html: forum.php 的页面 HTML
+        :return: 分组列表，元素形如 ``{"group": 名称, "boards": [{"fid", "name"}]}``
+        """
+        anchors = list(re.finditer(r'id="category_(\d+)"\s+class="bm_c"', html))
+        groups: List[Dict[str, Any]] = []
+        if not anchors:
+            # 站点结构调整时退化为平铺列表，保证仍可浏览
+            flat: Dict[str, str] = {}
+            for a in re.finditer(
+                r'<a[^>]*forumdisplay&(?:amp;)?fid=(\d+)[^>]*>(.*?)</a>', html, re.S
+            ):
+                label = html_lib.unescape(re.sub(r"<[^>]+>", "", a.group(2))).strip()
+                if label and a.group(1) not in flat:
+                    flat[a.group(1)] = label
+            if flat:
+                groups.append(
+                    {
+                        "group": "全部板块",
+                        "boards": [{"fid": fid, "name": name} for fid, name in flat.items()],
+                    }
+                )
+            return groups
+
+        for index, anchor in enumerate(anchors):
+            body_end = anchors[index + 1].start() if index + 1 < len(anchors) else len(html)
+            # 分组名称写在 category 容器之前最近的 h2 中
+            head = html[max(0, anchor.start() - 800): anchor.start()]
+            titles = re.findall(r"<h2[^>]*>(.*?)</h2>", head, re.S)
+            group_name = (
+                html_lib.unescape(re.sub(r"<[^>]+>", "", titles[-1])).strip()
+                if titles
+                else ""
+            )
+
+            body = html[anchor.end(): body_end]
+            # 只保留本容器内容，避免把下一个分组的头部算进来
+            next_title = body.find("<h2")
+            if next_title > 0:
+                body = body[:next_title]
+
+            boards: Dict[str, str] = {}
+            for item in re.finditer(
+                r'<a[^>]*forumdisplay&(?:amp;)?fid=(\d+)[^>]*>(.*?)</a>', body, re.S
+            ):
+                label = html_lib.unescape(re.sub(r"<[^>]+>", "", item.group(2))).strip()
+                if label and item.group(1) not in boards:
+                    boards[item.group(1)] = label
+            if not boards:
+                continue
+            groups.append(
+                {
+                    "group": group_name or "其它",
+                    "boards": [{"fid": fid, "name": name} for fid, name in boards.items()],
+                }
+            )
+        return groups
+
+    def list_boards(self) -> List[Dict[str, Any]]:
+        """获取论坛板块列表，按站点总目录分组。
+
+        :return: 分组列表，元素包含总目录名称与该目录下的板块
         """
         html = self._with_session(lambda page: self._goto_html(page, self.site_url + "/forum.php"))
-        boards: Dict[str, str] = {}
-        for fid, name in re.findall(
-            r'forumdisplay&(?:amp;)?fid=(\d+)"[^>]*>([^<]{1,60})</a>', html
-        ):
-            name = name.strip()
-            if name and fid not in boards:
-                boards[fid] = name
-        return [{"fid": fid, "name": name} for fid, name in boards.items()]
+        return self.parse_boards(html)
 
     def list_threads(self, fid: str, page_no: int = 1) -> Dict[str, Any]:
         """获取指定板块的帖子列表。
