@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pytz
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import Request
+from fastapi import Response
 from fastapi.responses import HTMLResponse
 
 from app.core.config import settings
@@ -37,7 +38,7 @@ class SehuaSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     # 插件作者
     plugin_author = "local"
     # 插件配置项ID前缀
@@ -66,6 +67,8 @@ class SehuaSignIn(_PluginBase):
     _forum_page_size: int = 20
     _forum_idle_minutes: int = 10
     _forum_allow_reply: bool = False
+    _forum_show_images: bool = True
+    _forum_max_images: int = 12
 
     # 运行状态
     _running: bool = False
@@ -98,6 +101,8 @@ class SehuaSignIn(_PluginBase):
         self._forum_page_size = 20
         self._forum_idle_minutes = 10
         self._forum_allow_reply = False
+        self._forum_show_images = True
+        self._forum_max_images = 12
 
         if config:
             self._enabled = bool(config.get("enabled"))
@@ -117,6 +122,8 @@ class SehuaSignIn(_PluginBase):
             self._forum_page_size = max(5, min(50, int(config.get("forum_page_size") or 20)))
             self._forum_idle_minutes = max(1, int(config.get("forum_idle_minutes") or 10))
             self._forum_allow_reply = bool(config.get("forum_allow_reply"))
+            self._forum_show_images = bool(config.get("forum_show_images", True))
+            self._forum_max_images = max(1, min(50, int(config.get("forum_max_images") or 12)))
 
         # 回收上一次插件实例遗留的浏览器进程
         self._cleanup_orphan_browsers()
@@ -184,6 +191,13 @@ class SehuaSignIn(_PluginBase):
                 "methods": ["POST"],
                 "summary": "在帖子中提交回复",
                 "description": "以浏览器表单方式提交回复，返回可自动关闭的结果页。",
+            },
+            {
+                "path": "/image",
+                "endpoint": self.api_image,
+                "methods": ["GET"],
+                "summary": "代理读取帖子图片",
+                "description": "站点图床校验 Referer，由插件带正确来源抓取图片后回传给浏览器。",
             },
         ]
 
@@ -444,6 +458,120 @@ class SehuaSignIn(_PluginBase):
         except Exception as error:  # noqa: BLE001 - 统一返回可读错误
             logger.error(f"【98堂浏览】读取失败：{error}")
             return self._envelope(False, f"读取失败：{error}")
+
+    # ------------------------------------------------------------ 图片代理
+    def _image_proxy_url(self, image_url: str) -> str:
+        """把原图地址转换为插件图片代理地址。
+
+        :param image_url: 站点正文中的原始图片地址
+        :return: 指向插件代理接口的地址
+        """
+        from urllib.parse import quote
+
+        plugin_id = self.__class__.__name__
+        base = settings.MP_DOMAIN(f"/api/v1/plugin/{plugin_id}/image") or (
+            f"/api/v1/plugin/{plugin_id}/image"
+        )
+        return f"{base}?url={quote(image_url, safe='')}&apikey={settings.API_TOKEN or ''}"
+
+    @staticmethod
+    def _unsafe_image_target(url: str) -> bool:
+        """判断图片地址是否指向内网等不安全目标。
+
+        :param url: 待校验的图片地址
+        :return: 属于不安全目标时返回 True
+        """
+        from urllib.parse import urlsplit
+
+        import ipaddress
+        import socket
+
+        try:
+            parts = urlsplit(url)
+            if parts.scheme not in ("http", "https"):
+                return True
+            host = parts.hostname or ""
+            if not host:
+                return True
+            if host.lower() in ("localhost", "localhost.localdomain"):
+                return True
+            try:
+                infos = socket.getaddrinfo(host, None)
+            except OSError:
+                return False
+            for info in infos:
+                address = info[4][0]
+                try:
+                    ip = ipaddress.ip_address(address)
+                except ValueError:
+                    continue
+                if (
+                    ip.is_private
+                    or ip.is_loopback
+                    or ip.is_link_local
+                    or ip.is_reserved
+                    or ip.is_multicast
+                    or ip.is_unspecified
+                ):
+                    return True
+            return False
+        except Exception:  # noqa: BLE001 - 解析异常按不安全处理
+            return True
+
+    def api_image(self, url: str = "") -> Response:
+        """代理抓取帖子图片并回传。
+
+        站点图床会校验来源，缺失正确 Referer 时返回 403；由插件携带站点来源抓取，
+        浏览器即可正常显示。
+
+        :param url: 原始图片地址
+        :return: 图片响应
+        """
+        import httpx
+
+        target = (url or "").strip()
+        if not target:
+            return Response(status_code=400, content="缺少图片地址")
+        if self._unsafe_image_target(target):
+            logger.warn(f"【98堂浏览】已拒绝不安全的图片地址：{target[:120]}")
+            return Response(status_code=400, content="图片地址不受支持")
+
+        try:
+            with httpx.Client(timeout=20, follow_redirects=True) as client:
+                response = client.get(
+                    target,
+                    headers={
+                        "Referer": self._site_url + "/",
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/139.0.0.0 Safari/537.36"
+                        ),
+                        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                    },
+                )
+            if response.status_code != 200:
+                logger.warn(
+                    f"【98堂浏览】图片抓取失败 {response.status_code}：{target[:120]}"
+                )
+                return Response(status_code=502, content="图片抓取失败")
+
+            content_type = (response.headers.get("content-type") or "").lower()
+            if not content_type.startswith("image/"):
+                logger.warn(f"【98堂浏览】图片类型异常 {content_type}：{target[:120]}")
+                return Response(status_code=415, content="返回内容不是图片")
+
+            data = response.content
+            if not data:
+                return Response(status_code=502, content="图片内容为空")
+            return Response(
+                content=data,
+                media_type=content_type.split(";")[0].strip(),
+                headers={"Cache-Control": "public, max-age=3600"},
+            )
+        except Exception as error:  # noqa: BLE001 - 统一转为可读错误
+            logger.error(f"【98堂浏览】图片代理异常：{error}")
+            return Response(status_code=502, content="图片抓取异常")
 
     async def api_reply(self, request: Request) -> HTMLResponse:
         """提交帖子回复并返回可自动关闭的结果页。
@@ -791,6 +919,35 @@ class SehuaSignIn(_PluginBase):
                                     }
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "forum_show_images",
+                                            "label": "显示帖子图片",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "forum_max_images",
+                                            "label": "每层最多显示图片数",
+                                            "type": "number",
+                                            "hint": "图片由本机经插件转发，调小可省流量",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
                     {
@@ -851,6 +1008,8 @@ class SehuaSignIn(_PluginBase):
             "forum_allow_reply": False,
             "forum_page_size": 20,
             "forum_idle_minutes": 10,
+            "forum_show_images": True,
+            "forum_max_images": 12,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -1044,31 +1203,7 @@ class SehuaSignIn(_PluginBase):
                 }
             ]
             for index, post in enumerate(posts, start=1):
-                body.append(
-                    {
-                        "component": "VCard",
-                        "props": {"class": "ma-2", "variant": "outlined"},
-                        "content": [
-                            {
-                                "component": "VCardSubtitle",
-                                "props": {
-                                    "text": f"{index}. {post.get('author') or '匿名'}　{post.get('time') or ''}"
-                                },
-                            },
-                            {
-                                "component": "VCardText",
-                                "props": {"class": "text-body-2"},
-                                "content": [
-                                    {
-                                        "component": "div",
-                                        "props": {"style": "white-space: pre-wrap;"},
-                                        "text": post.get("content") or "（无正文内容）",
-                                    }
-                                ],
-                            },
-                        ],
-                    }
-                )
+                body.append(self._post_card(index, post))
             body.extend(self._pager("thread", state, data))
             if self._forum_allow_reply:
                 body.append(self._reply_form(state, data))
@@ -1080,6 +1215,69 @@ class SehuaSignIn(_PluginBase):
                 "content": body,
             }
         ]
+
+    def _post_card(self, index: int, post: Dict[str, Any]) -> dict:
+        """构建一个楼层卡片，正文按需附带图片。
+
+        :param index: 楼层序号
+        :param post: 楼层数据
+        :return: 楼层卡片元素
+        """
+        content: List[dict] = [
+            {
+                "component": "div",
+                "props": {"style": "white-space: pre-wrap;"},
+                "text": post.get("content") or "（无正文内容）",
+            }
+        ]
+
+        images = list(post.get("images") or []) if self._forum_show_images else []
+        if images:
+            shown = images[: self._forum_max_images]
+            content.append(
+                {
+                    "component": "div",
+                    "props": {"class": "text-caption text-medium-emphasis mt-2"},
+                    "text": f"图片 {len(images)} 张"
+                    + (
+                        f"（仅显示前 {len(shown)} 张）"
+                        if len(images) > len(shown)
+                        else ""
+                    ),
+                }
+            )
+            for image_url in shown:
+                content.append(
+                    {
+                        "component": "VImg",
+                        "props": {
+                            "src": self._image_proxy_url(image_url),
+                            "class": "my-2 rounded",
+                            "max-width": "100%",
+                            "max-height": "640",
+                            "contain": True,
+                            "loading": "lazy",
+                        },
+                    }
+                )
+
+        return {
+            "component": "VCard",
+            "props": {"class": "ma-2", "variant": "outlined"},
+            "content": [
+                {
+                    "component": "VCardSubtitle",
+                    "props": {
+                        "text": f"{index}. {post.get('author') or '匿名'}　{post.get('time') or ''}"
+                    },
+                },
+                {
+                    "component": "VCardText",
+                    "props": {"class": "text-body-2"},
+                    "content": content,
+                },
+            ],
+        }
 
     def _nav_event(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """构建切换浏览视图的点击事件，并附带插件 API 鉴权参数。
