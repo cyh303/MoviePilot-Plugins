@@ -37,7 +37,7 @@ class SehuaSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.1.6"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "local"
     # 插件配置项ID前缀
@@ -303,7 +303,7 @@ class SehuaSignIn(_PluginBase):
         view = str(state.get("view") or "index")
         # 距上次浏览超过一定时间视为新一次访问，回到板块列表
         last = float(state.get("time") or 0)
-        if last and datetime.now().timestamp() - last > 1800:
+        if last and datetime.now().timestamp() - last > 600:
             view = "index"
         if view not in ("index", "forum", "thread"):
             view = "index"
@@ -969,7 +969,12 @@ class SehuaSignIn(_PluginBase):
                         "click": {
                             "api": f"plugin/{self.__class__.__name__}/nav",
                             "method": "get",
-                            "params": {"view": "forum", "fid": board.get("fid", ""), "page": 1},
+                            "params": {
+                                "view": "forum",
+                                "fid": board.get("fid", ""),
+                                "page": 1,
+                                "apikey": settings.API_TOKEN,
+                            },
                         }
                     },
                 }
@@ -1003,6 +1008,7 @@ class SehuaSignIn(_PluginBase):
                                 "tid": thread.get("tid", ""),
                                 "fid": state["fid"],
                                 "tpage": 1,
+                                "apikey": settings.API_TOKEN,
                             },
                         }
                     },
@@ -1072,6 +1078,21 @@ class SehuaSignIn(_PluginBase):
             }
         ]
 
+    def _nav_event(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """构建切换浏览视图的点击事件，并附带插件 API 鉴权参数。
+
+        :param params: 视图切换参数
+        :return: events 定义中的 click 事件
+        """
+        payload = dict(params)
+        # 页面渲染器直接以查询参数调用插件 API，需要显式带上 apikey 才能通过鉴权
+        payload["apikey"] = settings.API_TOKEN
+        return {
+            "api": f"plugin/{self.__class__.__name__}/nav",
+            "method": "get",
+            "params": payload,
+        }
+
     def _forum_nav_buttons(self, view: str, state: Dict[str, Any]) -> List[dict]:
         """构建论坛浏览顶部操作按钮。
 
@@ -1079,7 +1100,6 @@ class SehuaSignIn(_PluginBase):
         :param state: 浏览状态
         :return: 按钮元素列表
         """
-        plugin_id = self.__class__.__name__
         buttons: List[dict] = []
 
         def button(text: str, params: Dict[str, Any], icon: str = "") -> dict:
@@ -1097,13 +1117,7 @@ class SehuaSignIn(_PluginBase):
                 "component": "VBtn",
                 "props": props,
                 "text": text,
-                "events": {
-                    "click": {
-                        "api": f"plugin/{plugin_id}/nav",
-                        "method": "get",
-                        "params": params,
-                    }
-                },
+                "events": {"click": self._nav_event(params)},
             }
 
         if view != "index":
@@ -1133,7 +1147,6 @@ class SehuaSignIn(_PluginBase):
         :param data: 当前视图数据
         :return: 翻页元素列表
         """
-        plugin_id = self.__class__.__name__
         current = int(data.get("page") or 1)
         max_page = max(1, int(data.get("max_page") or 1))
         if max_page <= 1:
@@ -1163,13 +1176,7 @@ class SehuaSignIn(_PluginBase):
                 "component": "VBtn",
                 "props": {"variant": "text", "size": "small"},
                 "text": text,
-                "events": {
-                    "click": {
-                        "api": f"plugin/{plugin_id}/nav",
-                        "method": "get",
-                        "params": params,
-                    }
-                },
+                "events": {"click": self._nav_event(params)},
             }
 
         controls: List[dict] = []
