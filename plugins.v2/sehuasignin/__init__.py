@@ -1,7 +1,8 @@
 """98堂（色花堂）论坛每日自动签到插件。
 
 插件使用内嵌浏览器通过站点的 Cloudflare 校验与年龄确认页，使用账号、密码与
-安全提问登录 Discuz 论坛，自动识别并解答旋转验证码后完成每日签到。
+安全提问登录 Discuz 论坛，自动识别并解答旋转验证码后完成每日签到；另提供论坛
+板块、帖子浏览与回复入口。
 """
 
 import threading
@@ -10,11 +11,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
 from apscheduler.triggers.cron import CronTrigger
+from fastapi import Request
+from fastapi.responses import HTMLResponse
 
+from app.core.config import settings
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import MessageType
 
+from .forum import SehuaForumError, SehuaForumSession
 from .signer import QUESTION_CHOICES, SehuaSigner
 
 
@@ -24,11 +29,11 @@ class SehuaSignIn(_PluginBase):
     # 插件名称
     plugin_name = "98堂自动签到"
     # 插件描述
-    plugin_desc = "色花堂/98堂 Discuz 论坛每日自动签到，内嵌浏览器通过 Cloudflare 与年龄确认页，自动解答旋转验证码。"
+    plugin_desc = "色花堂/98堂 Discuz 论坛每日自动签到，并可在插件内浏览板块与帖子、参与回复。"
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "local"
     # 插件配置项ID前缀
@@ -52,10 +57,18 @@ class SehuaSignIn(_PluginBase):
     _captcha_retry: int = 8
     _headless: bool = True
     _timeout: int = 60
+    # 论坛浏览相关配置
+    _forum_enabled: bool = True
+    _forum_page_size: int = 20
+    _forum_idle_minutes: int = 10
+    _forum_allow_reply: bool = False
 
     # 运行状态
     _running: bool = False
     _lock: Optional[threading.Lock] = None
+    _forum: Optional[SehuaForumSession] = None
+    _forum_lock: Optional[threading.Lock] = None
+    _forum_signature: str = ""
 
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态。
@@ -66,6 +79,8 @@ class SehuaSignIn(_PluginBase):
         self._running = False
         if self._lock is None:
             self._lock = threading.Lock()
+        if self._forum_lock is None:
+            self._forum_lock = threading.Lock()
 
         self._enabled = False
         self._notify = False
@@ -80,6 +95,10 @@ class SehuaSignIn(_PluginBase):
         self._captcha_retry = 8
         self._headless = True
         self._timeout = 60
+        self._forum_enabled = True
+        self._forum_page_size = 20
+        self._forum_idle_minutes = 10
+        self._forum_allow_reply = False
 
         if config:
             self._enabled = bool(config.get("enabled"))
@@ -95,6 +114,10 @@ class SehuaSignIn(_PluginBase):
             self._captcha_retry = int(config.get("captcha_retry") or 8)
             self._headless = bool(config.get("headless", True))
             self._timeout = int(config.get("timeout") or 60)
+            self._forum_enabled = bool(config.get("forum_enabled", True))
+            self._forum_page_size = max(5, min(50, int(config.get("forum_page_size") or 20)))
+            self._forum_idle_minutes = max(1, int(config.get("forum_idle_minutes") or 10))
+            self._forum_allow_reply = bool(config.get("forum_allow_reply"))
 
         if self._onlyonce and self._enabled:
             logger.info("【98堂签到】立即运行一次")
@@ -139,7 +162,21 @@ class SehuaSignIn(_PluginBase):
                 "methods": ["GET"],
                 "summary": "立即执行一次 98堂签到",
                 "description": "手动触发一次签到流程，返回执行结果。",
-            }
+            },
+            {
+                "path": "/nav",
+                "endpoint": self.api_nav,
+                "methods": ["GET"],
+                "summary": "切换论坛浏览视图",
+                "description": "读取板块列表、帖子列表或帖子内容，并记录当前浏览位置。",
+            },
+            {
+                "path": "/reply",
+                "endpoint": self.api_reply,
+                "methods": ["POST"],
+                "summary": "在帖子中提交回复",
+                "description": "以浏览器表单方式提交回复，返回可自动关闭的结果页。",
+            },
         ]
 
     def api_signin(self) -> Dict[str, Any]:
@@ -149,6 +186,245 @@ class SehuaSignIn(_PluginBase):
         """
         success, message = self.signin()
         return {"success": success, "message": message}
+
+    # ------------------------------------------------------------ 论坛浏览支持
+    def _forum_session(self) -> SehuaForumSession:
+        """获取论坛浏览会话，配置变化时自动重建。
+
+        :return: 论坛会话对象
+        """
+        signature = "|".join(
+            [
+                self._site_url,
+                self._username,
+                self._proxy,
+                str(self._headless),
+                str(self._timeout),
+                str(self._forum_idle_minutes),
+            ]
+        )
+        assert self._forum_lock is not None
+        with self._forum_lock:
+            if self._forum is None or self._forum_signature != signature:
+                if self._forum is not None:
+                    self._forum.close()
+                self._forum = SehuaForumSession(
+                    site_url=self._site_url,
+                    username=self._username,
+                    password=self._password,
+                    question_id=self._question_id,
+                    answer=self._answer,
+                    proxy=self._proxy,
+                    headless=self._headless,
+                    timeout=self._timeout,
+                    idle_seconds=self._forum_idle_minutes * 60,
+                    log=lambda message: logger.info(f"【98堂浏览】{message}"),
+                )
+                self._forum_signature = signature
+            return self._forum
+
+    def _nav_state(self) -> Dict[str, Any]:
+        """读取当前浏览位置。
+
+        :return: 浏览状态字典
+        """
+        state = self.get_data("nav") or {}
+        return {
+            "view": str(state.get("view") or "index"),
+            "fid": str(state.get("fid") or ""),
+            "page": max(1, int(state.get("page") or 1)),
+            "tid": str(state.get("tid") or ""),
+            "tpage": max(1, int(state.get("tpage") or 1)),
+        }
+
+    def _save_nav_state(self, state: Dict[str, Any]) -> None:
+        """保存当前浏览位置。
+
+        :param state: 浏览状态字典
+        """
+        self.save_data("nav", state)
+
+    def _cached_view(self, key: str) -> Optional[Dict[str, Any]]:
+        """读取浏览缓存。
+
+        :param key: 缓存键
+        :return: 命中且未过期的缓存内容
+        """
+        cache = self.get_data("nav_cache") or {}
+        if cache.get("key") != key:
+            return None
+        if datetime.now().timestamp() - float(cache.get("time") or 0) > 120:
+            return None
+        return cache.get("data")
+
+    def _store_view(self, key: str, data: Dict[str, Any]) -> None:
+        """写入浏览缓存。
+
+        :param key: 缓存键
+        :param data: 待缓存内容
+        """
+        self.save_data(
+            "nav_cache",
+            {"key": key, "time": datetime.now().timestamp(), "data": data},
+        )
+
+    @staticmethod
+    def _cache_key(state: Dict[str, Any]) -> str:
+        """计算浏览状态的缓存键。
+
+        :param state: 浏览状态字典
+        :return: 缓存键
+        """
+        return f"{state['view']}:{state['fid']}:{state['page']}:{state['tid']}:{state['tpage']}"
+
+    def _load_view(self, state: Dict[str, Any], refresh: bool = False) -> Dict[str, Any]:
+        """按浏览状态读取数据，必要时回源站点。
+
+        :param state: 浏览状态字典
+        :param refresh: 是否强制回源
+        :return: 视图数据
+        """
+        key = self._cache_key(state)
+        if not refresh:
+            cached = self._cached_view(key)
+            if cached is not None:
+                return cached
+        session = self._forum_session()
+        if state["view"] == "forum":
+            data = session.list_threads(state["fid"], state["page"])
+            data["view"] = "forum"
+        elif state["view"] == "thread":
+            data = session.get_thread(state["tid"], state["tpage"])
+            data["view"] = "thread"
+            if not data.get("fid"):
+                data["fid"] = state["fid"]
+        else:
+            data = {"view": "index", "boards": session.list_boards()}
+        self._store_view(key, data)
+        return data
+
+    def api_nav(
+        self,
+        view: str = "index",
+        fid: str = "",
+        page: int = 1,
+        tid: str = "",
+        tpage: int = 1,
+        refresh: int = 0,
+    ) -> Dict[str, Any]:
+        """切换浏览视图并缓存目标页面内容。
+
+        :param view: 视图类型，index、forum 或 thread
+        :param fid: 板块 ID
+        :param page: 帖子列表页码
+        :param tid: 帖子 ID
+        :param tpage: 帖子内容页码
+        :param refresh: 是否强制重新读取
+        :return: 执行结果
+        """
+        if not self._forum_enabled:
+            return {"success": False, "message": "论坛浏览未启用"}
+        state = {
+            "view": view if view in ("index", "forum", "thread") else "index",
+            "fid": str(fid or ""),
+            "page": max(1, int(page or 1)),
+            "tid": str(tid or ""),
+            "tpage": max(1, int(tpage or 1)),
+        }
+        if state["view"] == "forum" and not state["fid"]:
+            state["view"] = "index"
+        if state["view"] == "thread" and not state["tid"]:
+            state["view"] = "forum" if state["fid"] else "index"
+        self._save_nav_state(state)
+        try:
+            self._load_view(state, refresh=bool(refresh))
+            return {"success": True, "message": ""}
+        except SehuaForumError as error:
+            return {"success": False, "message": str(error)}
+        except Exception as error:  # noqa: BLE001 - 统一返回可读错误
+            logger.error(f"【98堂浏览】读取失败：{error}")
+            return {"success": False, "message": f"读取失败：{error}"}
+
+    async def api_reply(self, request: Request) -> HTMLResponse:
+        """提交帖子回复并返回可自动关闭的结果页。
+
+        :param request: 请求对象，接受表单或 JSON 提交
+        :return: 结果页面
+        """
+        form: Dict[str, Any] = {}
+        try:
+            form = dict(await request.form())
+        except Exception:  # noqa: BLE001 - 非表单提交时按 JSON 解析
+            form = {}
+        if not form:
+            try:
+                form = dict(await request.json())
+            except Exception:  # noqa: BLE001 - 无法解析时保持空字典
+                form = {}
+
+        tid = str(form.get("tid") or "")
+        fid = str(form.get("fid") or "")
+        message = str(form.get("message") or "")
+
+        if not self._forum_enabled:
+            return self._reply_page(False, "论坛浏览未启用")
+        if not self._forum_allow_reply:
+            return self._reply_page(False, "插件内回复未启用，请在插件配置中开启")
+        if not tid or not message.strip():
+            return self._reply_page(False, "缺少帖子 ID 或回复内容")
+
+        try:
+            success, result = self._forum_session().reply(tid, fid, message)
+        except SehuaForumError as error:
+            success, result = False, str(error)
+        except Exception as error:  # noqa: BLE001 - 统一转为可读结果
+            logger.error(f"【98堂浏览】回复失败：{error}")
+            success, result = False, f"回复失败：{error}"
+
+        if success:
+            self.save_data(
+                "reply_history",
+                (
+                    [
+                        {
+                            "time": datetime.now(pytz.timezone("Asia/Shanghai")).strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            ),
+                            "tid": tid,
+                            "message": message[:100],
+                            "success": True,
+                        }
+                    ]
+                    + (self.get_data("reply_history") or [])
+                )[:20],
+            )
+        else:
+            logger.warn(f"【98堂浏览】回复未成功：{result}")
+        return self._reply_page(success, result)
+
+    @staticmethod
+    def _reply_page(success: bool, message: str) -> HTMLResponse:
+        """生成回复结果页面。
+
+        :param success: 是否成功
+        :param message: 结果说明
+        :return: 自动关闭的结果页
+        """
+        color = "#2e7d32" if success else "#c62828"
+        title = "回复成功" if success else "回复未成功"
+        body = (
+            f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            f"<title>{title}</title></head>"
+            f"<body style=\"font-family:system-ui,-apple-system,'Segoe UI',sans-serif;"
+            f"padding:28px;line-height:1.7;color:#333\">"
+            f"<h3 style='color:{color};margin:0 0 12px'>{title}</h3>"
+            f"<div style='color:#555'>{message}</div>"
+            f"<p style='color:#888;font-size:13px;margin-top:20px'>本页将在 3 秒后自动关闭，"
+            f"请在插件页面点击「刷新」查看最新内容。</p>"
+            f"<script>setTimeout(function(){{window.close();}},3000);</script>"
+            f"</body></html>"
+        )
+        return HTMLResponse(content=body)
 
     def get_service(self) -> List[Dict[str, Any]]:
         """返回插件的定时服务列表。
@@ -359,6 +635,69 @@ class SehuaSignIn(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "forum_enabled",
+                                            "label": "启用论坛浏览",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "forum_allow_reply",
+                                            "label": "允许插件内回复",
+                                            "hint": "开启后可在帖子页面直接提交回复",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "forum_page_size",
+                                            "label": "列表每页条数",
+                                            "type": "number",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "forum_idle_minutes",
+                                            "label": "会话空闲回收（分钟）",
+                                            "type": "number",
+                                            "hint": "浏览会话空闲超时后自动关闭浏览器",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12},
                                 "content": [
                                     {
@@ -408,6 +747,10 @@ class SehuaSignIn(_PluginBase):
             "proxy": "",
             "captcha_retry": 8,
             "timeout": 60,
+            "forum_enabled": True,
+            "forum_allow_reply": False,
+            "forum_page_size": 20,
+            "forum_idle_minutes": 10,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -465,11 +808,342 @@ class SehuaSignIn(_PluginBase):
                     },
                 ],
             },
+        ] + self._forum_page()
+
+    # ------------------------------------------------------------ 论坛浏览页面
+    def _forum_page(self) -> List[dict]:
+        """构建论坛浏览页面元素。
+
+        :return: 页面元素列表
+        """
+        if not self._forum_enabled:
+            return []
+
+        state = self._nav_state()
+        try:
+            data = self._load_view(state)
+        except SehuaForumError as error:
+            return [
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "error",
+                        "variant": "tonal",
+                        "title": "论坛读取失败",
+                        "text": str(error),
+                    },
+                }
+            ]
+        except Exception as error:  # noqa: BLE001 - 统一降级为可读提示
+            logger.error(f"【98堂浏览】页面渲染失败：{error}")
+            return [
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "error",
+                        "variant": "tonal",
+                        "title": "论坛读取失败",
+                        "text": f"{error}",
+                    },
+                }
+            ]
+
+        view = data.get("view") or "index"
+        header = [
+            {
+                "component": "VCard",
+                "props": {"class": "mt-3", "variant": "tonal"},
+                "content": [
+                    {
+                        "component": "VCardTitle",
+                        "props": {
+                            "class": "d-flex align-center",
+                            "text": "论坛浏览",
+                        },
+                    },
+                    {
+                        "component": "VCardText",
+                        "props": {"class": "pt-0"},
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"class": "d-flex flex-wrap ga-2"},
+                                "content": self._forum_nav_buttons(view, state),
+                            }
+                        ],
+                    },
+                ],
+            }
         ]
+
+        if view == "index":
+            items = [
+                {
+                    "component": "VListItem",
+                    "props": {
+                        "title": board.get("name", ""),
+                        "subtitle": f"板块 ID {board.get('fid', '')}",
+                        "append-icon": "mdi-chevron-right",
+                    },
+                    "events": {
+                        "click": {
+                            "api": f"plugin/{self.__class__.__name__}/nav",
+                            "method": "get",
+                            "params": {"view": "forum", "fid": board.get("fid", ""), "page": 1},
+                        }
+                    },
+                }
+                for board in (data.get("boards") or [])
+            ]
+            body = [
+                {"component": "VCardTitle", "props": {"text": f"板块列表（{len(items)}）"}},
+                {"component": "VList", "props": {"density": "compact"}, "content": items},
+            ]
+        elif view == "forum":
+            threads = (data.get("threads") or [])[: self._forum_page_size]
+            items = [
+                {
+                    "component": "VListItem",
+                    "props": {
+                        "title": thread.get("title", ""),
+                        "subtitle": f"作者 {thread.get('author') or '未知'}　回复 {thread.get('replies')}　ID {thread.get('tid')}",
+                        "append-icon": "mdi-message-text-outline",
+                    },
+                    "events": {
+                        "click": {
+                            "api": f"plugin/{self.__class__.__name__}/nav",
+                            "method": "get",
+                            "params": {
+                                "view": "thread",
+                                "tid": thread.get("tid", ""),
+                                "fid": state["fid"],
+                                "tpage": 1,
+                            },
+                        }
+                    },
+                }
+                for thread in threads
+            ]
+            body = [
+                {
+                    "component": "VCardTitle",
+                    "props": {
+                        "text": f"{data.get('board') or '板块'}　第 {data.get('page', 1)}/{data.get('max_page', 1)} 页"
+                    },
+                },
+                {"component": "VList", "props": {"density": "compact"}, "content": items},
+            ]
+            body.extend(self._pager("forum", state, data))
+        else:
+            posts = (data.get("posts") or [])[: self._forum_page_size]
+            body = [
+                {
+                    "component": "VCardTitle",
+                    "props": {
+                        "text": f"{data.get('title') or '帖子'}　第 {data.get('page', 1)}/{data.get('max_page', 1)} 页"
+                    },
+                }
+            ]
+            for index, post in enumerate(posts, start=1):
+                body.append(
+                    {
+                        "component": "VCard",
+                        "props": {"class": "ma-2", "variant": "outlined"},
+                        "content": [
+                            {
+                                "component": "VCardSubtitle",
+                                "props": {
+                                    "text": f"{index}. {post.get('author') or '匿名'}　{post.get('time') or ''}"
+                                },
+                            },
+                            {
+                                "component": "VCardText",
+                                "props": {"class": "text-body-2"},
+                                "content": [
+                                    {
+                                        "component": "div",
+                                        "props": {"style": "white-space: pre-wrap;"},
+                                        "text": post.get("content") or "（无正文内容）",
+                                    }
+                                ],
+                            },
+                        ],
+                    }
+                )
+            body.extend(self._pager("thread", state, data))
+            if self._forum_allow_reply:
+                body.append(self._reply_form(state, data))
+
+        return header + [
+            {
+                "component": "VCard",
+                "props": {"class": "mt-3", "variant": "tonal"},
+                "content": body,
+            }
+        ]
+
+    def _forum_nav_buttons(self, view: str, state: Dict[str, Any]) -> List[dict]:
+        """构建论坛浏览顶部操作按钮。
+
+        :param view: 当前视图
+        :param state: 浏览状态
+        :return: 按钮元素列表
+        """
+        plugin_id = self.__class__.__name__
+        buttons: List[dict] = []
+
+        def button(text: str, params: Dict[str, Any], icon: str = "") -> dict:
+            """生成一个带事件绑定的按钮。
+
+            :param text: 按钮文本
+            :param params: 事件参数
+            :param icon: 图标名称
+            :return: 按钮元素
+            """
+            props: Dict[str, Any] = {"variant": "tonal", "size": "small"}
+            if icon:
+                props["prepend-icon"] = icon
+            return {
+                "component": "VBtn",
+                "props": props,
+                "text": text,
+                "events": {
+                    "click": {
+                        "api": f"plugin/{plugin_id}/nav",
+                        "method": "get",
+                        "params": params,
+                    }
+                },
+            }
+
+        if view != "index":
+            target = {"view": "index"} if view == "forum" else {
+                "view": "forum",
+                "fid": state["fid"],
+                "page": state["page"],
+            }
+            buttons.append(button("返回上一级", target, "mdi-arrow-left"))
+        buttons.append(button("刷新", {"view": view, "fid": state["fid"], "tid": state["tid"],
+                                       "page": state["page"], "tpage": state["tpage"],
+                                       "refresh": 1}, "mdi-refresh"))
+        return buttons
+
+    def _pager(self, mode: str, state: Dict[str, Any], data: Dict[str, Any]) -> List[dict]:
+        """构建翻页按钮。
+
+        :param mode: forum 或 thread
+        :param state: 浏览状态
+        :param data: 当前视图数据
+        :return: 翻页元素列表
+        """
+        plugin_id = self.__class__.__name__
+        current = int(data.get("page") or 1)
+        max_page = max(1, int(data.get("max_page") or 1))
+        if max_page <= 1:
+            return []
+
+        def pager_button(text: str, target_page: int) -> dict:
+            """生成翻页按钮。
+
+            :param text: 按钮文本
+            :param target_page: 目标页码
+            :return: 按钮元素
+            """
+            if mode == "forum":
+                params: Dict[str, Any] = {
+                    "view": "forum",
+                    "fid": state["fid"],
+                    "page": target_page,
+                }
+            else:
+                params = {
+                    "view": "thread",
+                    "tid": state["tid"],
+                    "fid": state["fid"],
+                    "tpage": target_page,
+                }
+            return {
+                "component": "VBtn",
+                "props": {"variant": "text", "size": "small"},
+                "text": text,
+                "events": {
+                    "click": {
+                        "api": f"plugin/{plugin_id}/nav",
+                        "method": "get",
+                        "params": params,
+                    }
+                },
+            }
+
+        controls: List[dict] = []
+        if current > 1:
+            controls.append(pager_button("上一页", current - 1))
+        controls.append(
+            {
+                "component": "span",
+                "props": {"class": "px-2 text-caption align-self-center"},
+                "text": f"{current} / {max_page}",
+            }
+        )
+        if current < max_page:
+            controls.append(pager_button("下一页", current + 1))
+        return [
+            {
+                "component": "VCardText",
+                "props": {"class": "d-flex align-center"},
+                "content": controls,
+            }
+        ]
+
+    def _reply_form(self, state: Dict[str, Any], data: Dict[str, Any]) -> dict:
+        """构建回复表单，使用原生表单提交以便直接输入内容。
+
+        :param state: 浏览状态
+        :param data: 当前帖子数据
+        :return: 表单元素
+        """
+        plugin_id = self.__class__.__name__
+        token = settings.API_TOKEN or ""
+        domain = settings.MP_DOMAIN(f"/api/v1/plugin/{plugin_id}/reply") or (
+            f"/api/v1/plugin/{plugin_id}/reply"
+        )
+        action = f"{domain}?apikey={token}"
+        fid = data.get("fid") or state.get("fid") or ""
+        html = (
+            "<form method='post' target='_blank' "
+            f"action=\"{action}\" style='margin-top:8px'>"
+            f"<input type='hidden' name='tid' value='{data.get('tid') or state['tid']}'>"
+            f"<input type='hidden' name='fid' value='{fid}'>"
+            "<textarea name='message' rows='4' required "
+            "style='width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;"
+            "border-radius:6px;font-family:inherit;font-size:14px' "
+            "placeholder='输入回复内容后点击发送'></textarea>"
+            "<button type='submit' style='margin-top:8px;padding:8px 18px;border:none;"
+            "border-radius:6px;background:#1976d2;color:#fff;font-size:14px;cursor:pointer'>"
+            "发送回复</button>"
+            "</form>"
+        )
+        return {
+            "component": "VCardText",
+            "content": [
+                {
+                    "component": "div",
+                    "props": {"class": "text-caption text-medium-emphasis mb-1"},
+                    "text": "发表回复（提交后请点击上方「刷新」查看结果）",
+                },
+                {"component": "div", "props": {}, "html": html},
+            ],
+        }
 
     def stop_service(self) -> None:
         """停止插件后台服务并释放资源。"""
         self._running = False
+        if self._forum is not None:
+            try:
+                self._forum.close()
+            except Exception:  # noqa: BLE001 - 释放失败不影响插件卸载
+                pass
+            self._forum = None
 
     def signin(self) -> Tuple[bool, str]:
         """执行一次签到并记录结果。
