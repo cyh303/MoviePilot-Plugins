@@ -193,6 +193,116 @@ def solve_rotate_angle(master_b64: str, thumb_b64: str) -> float:
     return float(best[1]) % 360
 
 
+# 拼图类验证码定位结果的最低置信度（低于该值宁可换一张）
+PUZZLE_MIN_CONFIDENCE = 0.45
+# 站点限流后的等待秒数（实测约 1 分钟恢复）
+RATE_LIMIT_WAIT = 60
+# 站点已支持的类型：rotate 为旋转，slide / drag 为拖动拼图
+SUPPORTED_CAPTCHA_TYPES = ("rotate", "slide", "drag")
+
+
+def solve_puzzle_offset(master_b64: str, thumb_b64: str) -> Tuple[int, int, float]:
+    """计算拼图类验证码（slide / drag）中待拖动贴图应放置的位置。
+
+    站点的缩略图带透明边距，需要在背景图中找到与它最匹配的位置。返回缩略图左上角
+    在背景图中的坐标 ``(x, y)``，该坐标即为应提交的答案（已实测可一次通过校验）。
+
+    :param master_b64: 背景图 base64 内容
+    :param thumb_b64: 待拖动贴图的 base64 内容
+    :return: ``(x, y, 置信度)``
+    """
+    import numpy as np
+    from PIL import Image
+
+    def _rgba(data: str) -> Any:
+        """解码为带透明通道的图像。
+
+        :param data: base64 图片字符串
+        :return: RGBA 图像对象
+        """
+        raw = data.split(",", 1)[-1]
+        return Image.open(io.BytesIO(base64.b64decode(raw))).convert("RGBA")
+
+    master = _rgba(master_b64)
+    thumb = _rgba(thumb_b64)
+    alpha = np.asarray(thumb.split()[3]) > 200
+    mask = alpha.copy()
+    if mask.shape[0] > 6 and mask.shape[1] > 6:
+        # 去掉边缘一圈，避免描边与投影干扰匹配
+        mask[:2, :] = False
+        mask[-2:, :] = False
+        mask[:, :2] = False
+        mask[:, -2:] = False
+        if mask.sum() < 50:
+            mask = alpha
+    if mask.sum() < 50:
+        raise SehuaSignError("拼图验证码的贴图内容过小，无法比对")
+
+    def _gray(image: Any) -> Any:
+        """转灰度浮点数组。
+
+        :param image: PIL 图像
+        :return: 灰度数组
+        """
+        return np.asarray(image.convert("L"), dtype=np.float32)
+
+    def _edge(array: Any) -> Any:
+        """计算梯度幅值，弱化整体亮度差异带来的干扰。
+
+        :param array: 灰度数组
+        :return: 梯度幅值数组
+        """
+        gx = np.zeros_like(array)
+        gy = np.zeros_like(array)
+        gx[:, 1:-1] = array[:, 2:] - array[:, :-2]
+        gy[1:-1, :] = array[2:, :] - array[:-2, :]
+        return np.sqrt(gx ** 2 + gy ** 2)
+
+    master_feature = _edge(_gray(master))
+    thumb_feature = _edge(_gray(thumb))
+    thumb_height, thumb_width = thumb_feature.shape
+    master_height, master_width = master_feature.shape
+    if thumb_height >= master_height or thumb_width >= master_width:
+        raise SehuaSignError("拼图验证码尺寸异常，无法比对")
+
+    template = thumb_feature[mask]
+    template = template - template.mean()
+    template_norm = float(np.sqrt((template ** 2).sum())) or 1.0
+
+    def _score(offset_x: int, offset_y: int) -> float:
+        """计算某个位置的归一化相关系数。
+
+        :param offset_x: 横向偏移
+        :param offset_y: 纵向偏移
+        :return: 相似度
+        """
+        patch = master_feature[
+            offset_y:offset_y + thumb_height, offset_x:offset_x + thumb_width
+        ][mask]
+        centered = patch - patch.mean()
+        norm = float(np.sqrt((centered ** 2).sum())) or 1.0
+        return float((template * centered).sum()) / (template_norm * norm)
+
+    best: Optional[Tuple[float, int, int]] = None
+    for offset_y in range(0, master_height - thumb_height + 1, 2):
+        for offset_x in range(0, master_width - thumb_width + 1, 2):
+            score = _score(offset_x, offset_y)
+            if best is None or score > best[0]:
+                best = (score, offset_x, offset_y)
+    if best is None:
+        raise SehuaSignError("拼图验证码无法在背景图中定位")
+
+    # 在粗搜索结果附近逐像素收敛
+    _, coarse_x, coarse_y = best
+    for offset_y in range(max(0, coarse_y - 2), min(master_height - thumb_height, coarse_y + 2) + 1):
+        for offset_x in range(max(0, coarse_x - 2), min(master_width - thumb_width, coarse_x + 2) + 1):
+            score = _score(offset_x, offset_y)
+            if score > best[0]:
+                best = (score, offset_x, offset_y)
+
+    return int(best[1]), int(best[2]), float(best[0])
+
+
 class SehuaSigner:
     """执行 98堂 论坛登录与每日签到的执行器。"""
 
@@ -215,8 +325,8 @@ class SehuaSigner:
         question_id: str = "7",
         answer: str = "",
         proxy: str = "",
-        captcha_retry: int = 8,
-        captcha_interval: float = 4.0,
+        captcha_retry: int = 12,
+        captcha_interval: float = 5.0,
         headless: bool = True,
         timeout: int = 60,
         log: Optional[Callable[[str], None]] = None,
@@ -243,8 +353,8 @@ class SehuaSigner:
         self.question_id = str(question_id or "0").strip()
         self.answer = (answer or "").strip()
         self.proxy = (proxy or "").strip()
-        self.captcha_retry = max(1, int(captcha_retry or 1))
-        self.captcha_interval = max(1.0, float(captcha_interval or 1.0))
+        self.captcha_retry = max(3, min(30, int(captcha_retry or 12)))
+        self.captcha_interval = max(2.0, min(30.0, float(captcha_interval or 5.0)))
         self.headless = bool(headless)
         self.timeout = max(20, int(timeout or 60))
         self._log = log
@@ -413,26 +523,57 @@ class SehuaSigner:
             try:
                 payload = json.loads(captcha)
             except Exception:  # noqa: BLE001 - 站点限流时可能返回非 JSON
-                self._log_info(f"第 {attempt} 次获取验证码返回异常，等待后重试")
-                time.sleep(self.captcha_interval)
+                self._log_info(
+                    f"第 {attempt} 次获取验证码返回异常（站点限流），"
+                    f"等待 {RATE_LIMIT_WAIT} 秒后重试"
+                )
+                time.sleep(RATE_LIMIT_WAIT)
                 continue
 
             data = payload.get("data") or {}
-            captcha_type = data.get("type")
-            last_type = captcha_type or last_type
-            if captcha_type != "rotate":
+            captcha_type = str(data.get("type") or "")
+            if not captcha_type:
+                # 站点在连续请求后会暂缓下发验证码，实测约需 1 分钟恢复
+                last_type = last_type or "限流"
                 self._log_info(
-                    f"第 {attempt} 次验证码类型为 {captcha_type or '未知'}，暂不支持，换一张重试"
+                    f"第 {attempt} 次未取到验证码（站点限流），"
+                    f"等待 {RATE_LIMIT_WAIT} 秒后重试"
+                )
+                time.sleep(RATE_LIMIT_WAIT)
+                continue
+            last_type = captcha_type
+
+            if captcha_type == "rotate":
+                angle = solve_rotate_angle(
+                    data.get("master_image_base64", ""),
+                    data.get("thumb_image_base64", ""),
+                )
+                answer = str(int(round(angle)))
+                self._log_info(f"第 {attempt} 次验证码为旋转类型，计算角度 {answer}°")
+            elif captcha_type in ("slide", "drag"):
+                offset_x, offset_y, confidence = solve_puzzle_offset(
+                    data.get("master_image_base64", ""),
+                    data.get("thumb_image_base64", ""),
+                )
+                if confidence < PUZZLE_MIN_CONFIDENCE:
+                    self._log_info(
+                        f"第 {attempt} 次验证码为拼图类型（{captcha_type}），"
+                        f"定位置信度偏低（{confidence:.2f}），换一张重试"
+                    )
+                    time.sleep(self.captcha_interval)
+                    continue
+                answer = f"{offset_x},{offset_y}"
+                self._log_info(
+                    f"第 {attempt} 次验证码为拼图类型（{captcha_type}），"
+                    f"计算落点 {answer}（置信度 {confidence:.2f}）"
+                )
+            else:
+                self._log_info(
+                    f"第 {attempt} 次验证码类型为 {captcha_type}，"
+                    f"暂不支持（当前支持 {'/'.join(SUPPORTED_CAPTCHA_TYPES)}），换一张重试"
                 )
                 time.sleep(self.captcha_interval)
                 continue
-
-            angle = solve_rotate_angle(
-                data.get("master_image_base64", ""),
-                data.get("thumb_image_base64", ""),
-            )
-            answer = int(round(angle))
-            self._log_info(f"第 {attempt} 次验证码为旋转类型，计算角度 {answer}°")
             check_result = page.evaluate(
                 """async ([url, value]) => {
                   const response = await fetch(url, {
@@ -468,4 +609,4 @@ class SehuaSigner:
                 return True, message
             return False, message or "签到失败"
 
-        return False, f"连续 {self.captcha_retry} 次均未遇到旋转类型验证码（最近类型：{last_type or '未知'}）"
+        return False, f"连续 {self.captcha_retry} 次均未通过验证码校验（最近类型：{last_type or '未知'}）"
