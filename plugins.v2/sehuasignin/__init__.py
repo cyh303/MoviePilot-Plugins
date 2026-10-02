@@ -31,7 +31,7 @@ class SehuaSignIn(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "2.0.0"
+    plugin_version = "2.1.0"
     # 插件作者
     plugin_author = "local"
     # 插件配置项ID前缀
@@ -52,7 +52,7 @@ class SehuaSignIn(_PluginBase):
     _password: str = ""
     _question_id: str = "7"
     _answer: str = ""
-    _captcha_retry: int = 8
+    _captcha_retry: int = 12
     _headless: bool = True
     _timeout: int = 60
 
@@ -80,7 +80,7 @@ class SehuaSignIn(_PluginBase):
         self._password = ""
         self._question_id = "7"
         self._answer = ""
-        self._captcha_retry = 8
+        self._captcha_retry = 12
         self._headless = True
         self._timeout = 60
 
@@ -95,7 +95,7 @@ class SehuaSignIn(_PluginBase):
             self._password = str(config.get("password") or "")
             self._question_id = str(config.get("question_id") or "0")
             self._answer = str(config.get("answer") or "")
-            self._captcha_retry = int(config.get("captcha_retry") or 8)
+            self._captcha_retry = max(6, int(config.get("captcha_retry") or 12))
             self._headless = bool(config.get("headless", True))
             self._timeout = int(config.get("timeout") or 60)
 
@@ -397,7 +397,7 @@ class SehuaSignIn(_PluginBase):
                                             "model": "captcha_retry",
                                             "label": "验证码重试次数",
                                             "type": "number",
-                                            "hint": "遇到非旋转类型验证码时的重试上限",
+                                            "hint": "支持旋转与拼图（拖动）类型；遇到暂不支持的类型或站点限流时按此上限重试",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -471,7 +471,7 @@ class SehuaSignIn(_PluginBase):
             "question_id": "7",
             "answer": "",
             "proxy": "",
-            "captcha_retry": 8,
+            "captcha_retry": 12,
             "timeout": 60,
         }
 
