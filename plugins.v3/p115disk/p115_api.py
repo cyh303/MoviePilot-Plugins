@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from threading import RLock
@@ -85,6 +86,11 @@ class P115Api:
 
         self._get_item_fail_records: Dict[str, Dict[str, float]] = {}
         self._get_item_blacklist: Dict[str, float] = {}
+
+        # 整文件 SHA1 缓存：键为 路径:大小:mtime，避免重试/秒传重复哈希大文件
+        self._sha1_cache: Dict[str, str] = {}
+        self._sha1_cache_max = 64
+        self._sha1_lock = RLock()
 
     def get_pid_by_path(self, path: Path) -> int:
         """
@@ -910,20 +916,101 @@ class P115Api:
 
         :param filepath (Path): 文件路径
         :param size (int): 前多少字节，为 None 则计算整个文件
+
+        :raises InterruptedError: 传输被取消
         """
         sha1 = hashes.Hash(hashes.SHA1())
-        with open(filepath, "rb") as f:
-            if size:
-                chunk = f.read(size)
+        if size:
+            with open(filepath, "rb") as f:
                 if global_vars.is_transfer_stopped(filepath.as_posix()):
                     raise InterruptedError
+                chunk = f.read(size)
+            sha1.update(chunk)
+            return sha1.finalize().hex()
+
+        # 大分块读取：8KB → 8MB，并降低取消检查频率（每块查一次约 200k 次函数调用）
+        chunk_size = 8 * 1024 * 1024
+        path_str = filepath.as_posix()
+        with open(filepath, "rb") as f:
+            P115Api._hint_sequential_read(f)
+            while chunk := f.read(chunk_size):
+                if global_vars.is_transfer_stopped(path_str):
+                    raise InterruptedError
                 sha1.update(chunk)
-            else:
-                while chunk := f.read(8192):
-                    if global_vars.is_transfer_stopped(filepath.as_posix()):
-                        raise InterruptedError
-                    sha1.update(chunk)
         return sha1.finalize().hex()
+
+    @staticmethod
+    def _hint_sequential_read(fileobj) -> None:
+        """
+        向内核声明顺序读，触发预读以减少大文件哈希的随机停顿
+
+        :param fileobj: 已打开的文件对象
+        """
+        fadvise = getattr(os, "posix_fadvise", None)
+        if fadvise is None:
+            return
+        try:
+            fadvise(fileobj.fileno(), 0, 0, os.POSIX_FADV_SEQUENTIAL)
+        except (OSError, ValueError):
+            pass
+
+    def _get_cached_sha1(self, filepath: Path) -> Optional[str]:
+        """
+        读取文件 SHA1 缓存（键为路径 + 大小 + mtime）
+
+        :param filepath (Path): 文件路径
+
+        :return str: 命中返回 SHA1，未命中返回 None
+        """
+        try:
+            stat = filepath.stat()
+        except OSError:
+            return None
+        key = f"{filepath.as_posix()}:{stat.st_size}:{int(stat.st_mtime)}"
+        with self._sha1_lock:
+            if len(self._sha1_cache) > self._sha1_cache_max:
+                self._sha1_cache.clear()
+            return self._sha1_cache.get(key)
+
+    def _store_cached_sha1(self, filepath: Path, value: str) -> None:
+        """
+        写入文件 SHA1 缓存
+
+        :param filepath (Path): 文件路径
+        :param value (str): 计算得到的 SHA1
+        """
+        try:
+            stat = filepath.stat()
+        except OSError:
+            return
+        key = f"{filepath.as_posix()}:{stat.st_size}:{int(stat.st_mtime)}"
+        with self._sha1_lock:
+            if len(self._sha1_cache) > self._sha1_cache_max:
+                self._sha1_cache.clear()
+            self._sha1_cache[key] = value
+
+    def _sha1_with_cache(self, filepath: Path) -> str:
+        """
+        计算文件 SHA1，命中缓存时直接返回
+
+        上传重试、重复上传同一文件（常见于秒传场景）可省去整文件哈希。
+
+        :param filepath (Path): 文件路径
+
+        :return str: 文件 SHA1
+        """
+        cached = self._get_cached_sha1(filepath)
+        if cached:
+            logger.debug(f"【P115Disk】SHA1 命中缓存: {filepath}")
+            return cached
+        started = monotonic()
+        value = self._calc_sha1(filepath)
+        self._store_cached_sha1(filepath, value)
+        logger.info(
+            f"【P115Disk】SHA1 计算完成: {filepath.name} "
+            f"耗时 {monotonic() - started:.1f}s"
+        )
+        return value
 
     def _get_oss_token(self) -> Tuple[str, str, str, str, datetime]:
         """
@@ -1000,10 +1087,10 @@ class P115Api:
             return None
         target_pid = target_dir_item.fileid
 
-        # 计算文件特征值
+        # 计算文件特征值（命中 SHA1 缓存时跳过整文件哈希）
         file_size = local_path.stat().st_size
         try:
-            file_sha1 = self._calc_sha1(local_path)
+            file_sha1 = self._sha1_with_cache(local_path)
         except InterruptedError:
             logger.info(f"【P115Disk】{local_path} 上传已取消！")
             return None
