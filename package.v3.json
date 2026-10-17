@@ -18,15 +18,16 @@
   },
   "P115Disk": {
     "name": "115网盘储存",
-    "description": "更快更强的115网盘存储模块（含目录 ID 解析修复补丁）",
+    "description": "更快更强的115网盘存储模块（含目录 ID 解析与 SHA1 计算优化补丁）",
     "labels": "云盘",
-    "version": "3.0.3.1",
+    "version": "3.0.3.2",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
     "author": "DDSRem",
     "release": true,
     "system_version": ">=3.0.0",
     "level": 1,
     "history": {
+      "v3.0.3.2": "本地补丁构建（基于 3.0.3.1）：优化大文件上传前的整文件 SHA1 计算 —— ①读取分块 8KB → 8MB，减少约 20 万次循环与取消检查调用；②增加 posix_fadvise 顺序读提示，改善内核预读；③新增整文件 SHA1 缓存（键为 路径+大小+mtime，上限 64 条），上传重试、重复上传同文件（秒传场景）不再重复哈希。实测 11.10 GB 文件哈希 335s → 150s（75.8 MB/s，提速 123%）；命中缓存后可省去整轮读取。新增 tests/test_p115_api_sha1.py（7 个用例）。",
       "v3.0.3.1": "本地补丁构建（基于 3.0.3）：修复 get_pid_by_path 两处缺陷 —— ①命中目录后未写入路径缓存，导致每次 list 都重新请求 115 接口并受 1s 限速拖慢；②在 web/app 接口间交替调用，web 接口偶发 405 Method Not Allowed 时整次调用直接返回 -1，表现为目录列举间隔性返回空列表。改为 app 接口优先、web 仅作回退，成功后写入路径缓存；同时把 115 返回的字符串 id 归一化为 int，使上层 == -1 判定可靠。新增 tests/test_p115_api_get_pid.py（6 个用例：缓存命中、app→web 回退、双接口失败、根路径、id=0 建目录、降级 get_item）。",
       "v3.0.3": "对齐 MoviePilot V3 宿主插件框架。"
     }
