@@ -245,7 +245,7 @@ class BatchTransferContracts(
         from app.chain.transfer import TransferChain
         from app.application.transfer.notifications import TransferSuccessNotification
         from app.schemas import FileItem, TransferInfo
-        from app.schemas.types import MediaType
+        from app.schemas.types import ContentType, MediaType, MessageType
         from app.sdk.media import MediaInfo, MetaInfoPath
 
         notices = []
@@ -274,8 +274,31 @@ class BatchTransferContracts(
                     username=None,
                 )
             )
+        template = """{
+            'title': '自定义 {{ title_year }} {{ season_episode }}',
+            'text': '{{ file_count }} 个文件|{{ total_size }}'
+                    '|{{ __transferinfo__.target_diritem.path }}'
+        }"""
+        system_config = Mock()
+        system_config.get.return_value = {ContentType.OrganizeSuccess.value: template}
+        self.enterContext(
+            patch(
+                "app.application.messaging.message.get_configured_system_config",
+                return_value=system_config,
+            )
+        )
         chain = SimpleNamespace(
-            runtime_config=SimpleNamespace(history_url=None), post_message=Mock()
+            runtime_config=SimpleNamespace(history_url=None),
+            messageoper=Mock(),
+            _normalize_notification_for_dispatch=(
+                TransferChain._normalize_notification_for_dispatch
+            ),
+            _dispatch_notification_steps=Mock(),
+        )
+        chain.post_message = Mock(
+            side_effect=lambda *args, **kwargs: TransferChain.post_message(
+                chain, *args, **kwargs
+            )
         )
         chain.send_transfer_message = lambda **kwargs: (
             TransferChain.send_transfer_message(chain, **kwargs)
@@ -283,12 +306,15 @@ class BatchTransferContracts(
         for url in (None, "https://moviepilot.example/history"):
             chain.runtime_config.history_url = url
             chain.post_message.reset_mock()
+            chain._dispatch_notification_steps.reset_mock()
             TransferChain._send_transfer_success_notifications(chain, notices)
             chain.post_message.assert_called_once()
-            message = chain.post_message.call_args.args[0]
-            self.assertIn("S01", message.title)
-            self.assertIn("E01-E02", message.title)
-            self.assertIn("2 个文件", message.text)
+            chain._dispatch_notification_steps.assert_called_once()
+            message = chain._dispatch_notification_steps.call_args.args[0]
+            self.assertEqual(message.title, "自定义 小林家的龙女仆 (2017) S01 E01-E02")
+            self.assertEqual(message.text, "2 个文件|200.0B|/target/")
+            self.assertEqual(message.ctype, ContentType.OrganizeSuccess)
+            self.assertEqual(message.mtype, MessageType.Organize)
             self.assertEqual(message.image, media.get_message_image())
             self.assertEqual(
                 message.buttons,
@@ -308,7 +334,6 @@ class BatchTransferContracts(
             media,
             notices[0].transferinfo,
             buttons=buttons,
-            batch=True,
         )
         self.assertEqual(chain.post_message.call_args.args[0].buttons, [buttons[0]])
         self.assertEqual(len(buttons), 2)
@@ -320,7 +345,7 @@ class BatchTransferContracts(
             }
         )
         TransferChain.send_transfer_message(
-            chain, notices[0].meta, media, foreign_result, buttons=buttons, batch=True
+            chain, notices[0].meta, media, foreign_result, buttons=buttons
         )
         self.assertEqual(chain.post_message.call_args.args[0].buttons, buttons)
 
@@ -638,6 +663,21 @@ class BatchTransferContracts(
                 result = self._execute_plan(name, overwrite_mode=mode)
                 self.assertEqual(result.success, expected)
                 self.assertEqual(old.fileid in self.storage.items, not expected)
+                if expected:
+                    steps = self.repository.get_snapshot(task_id=name).steps
+                    self.assertEqual(
+                        [
+                            step.kind
+                            for step in steps
+                            if step.phase in {"transfer", "cleanup"}
+                        ],
+                        [
+                            "stage_overwrite_target",
+                            "backup_overwrite_target",
+                            "promote_overwrite_target",
+                            "delete_overwrite_backup",
+                        ],
+                    )
         self.seed("preview")
         calls = list(self.storage.calls)
         self.storage.query_failed = True
@@ -645,6 +685,59 @@ class BatchTransferContracts(
         self.assertTrue(result.success)
         self.assertEqual(calls, self.storage.calls)
         self.assertEqual(self.repository.get_snapshot(task_id="preview").steps, ())
+
+    def test_native_overwrite_rejects_incomplete_stage(self) -> None:
+        """
+        批量接管下暂存大小校验仍生效，失败时保留源文件及旧目标
+        """
+        from app.chain.transfer.execution import _TransferManualReviewRequired
+
+        source = self.seed("incomplete-stage", mode="move")
+        target_path = Path(self.plans["incomplete-stage"].final_target_path)
+        old = self.storage.add(target_path.as_posix())
+        copy_item = self.storage.copy_item
+
+        def incomplete(*args: Any) -> Any:
+            item = copy_item(*args)
+            self.storage.items[item.fileid].size = 1
+            return item
+
+        with patch.object(self.storage, "copy_item", side_effect=incomplete):
+            with self.assertRaises(_TransferManualReviewRequired):
+                self._execute_plan("incomplete-stage", overwrite_mode="always")
+        self.assertEqual(self.storage.get_item_strict(target_path).fileid, old.fileid)
+        self.assertIn(source.fileid, self.storage.items)
+        self.assertFalse(any(kind == "rename" for kind, _ in self.storage.calls))
+
+    def test_native_move_overwrite_recovers_staged_copy(self) -> None:
+        """
+        暂存凭据入库后中断保留源与旧目标，恢复后不重复复制并完成清理
+        """
+        from app.application.transfer.execution import TransferExecutionCommand
+
+        name = "overwrite-recovery"
+        source = self.seed(name, mode="move")
+        target_path = Path(self.plans[name].final_target_path)
+        old = self.storage.add(target_path.as_posix())
+        complete = TransferExecutionCommand.complete
+
+        def crash(command: Any, **kwargs: Any) -> Any:
+            result = complete(command, **kwargs)
+            if kwargs["step"].intent.kind == "stage_overwrite_target":
+                raise SystemExit("injected process death")
+            return result
+
+        with patch.object(TransferExecutionCommand, "complete", crash):
+            with self.assertRaises(SystemExit):
+                self._execute_plan(name, overwrite_mode="always")
+        self.assertIn(source.fileid, self.storage.items)
+        self.assertEqual(self.storage.get_item_strict(target_path).fileid, old.fileid)
+        result = self._execute_plan(name, overwrite_mode="always")
+        self.assertTrue(result.success)
+        self.assertNotIn(source.fileid, self.storage.items)
+        self.assertNotIn(old.fileid, self.storage.items)
+        self.assertEqual(self.storage.get_item_strict(target_path).size, source.size)
+        self.assertEqual(sum(kind == "copy" for kind, _ in self.storage.calls), 1)
 
     def test_interception_rejects_before_cloud_write(self) -> None:
         """
@@ -1326,6 +1419,7 @@ class MemoryDrive:
                 fileid=str(self.next_id),
                 pickcode=f"pc{self.next_id}",
                 size=1024,
+                modify_time=1700000000,
             )
             self.items[item.fileid] = item
             return item.model_copy(deep=True)
@@ -1364,6 +1458,29 @@ class MemoryDrive:
         获取或创建测试目录
         """
         return self.get_item_strict(path) or self.add(path.as_posix(), "dir")
+
+    @staticmethod
+    def is_support_transtype(transfer_type: str) -> bool:
+        """
+        声明宿主可执行的同存储整理方式
+        """
+        return transfer_type in {"copy", "move"}
+
+    def copy_item(self, item: Any, path: Path, name: str) -> Any:
+        """
+        模拟宿主存储适配器复制并返回新文件身份
+        """
+        with self.lock:
+            self.calls.append(("copy", [item.fileid]))
+            copied = self.add((path / name).as_posix())
+            self.items[copied.fileid].size = item.size
+            return self.items[copied.fileid].model_copy(deep=True)
+
+    def rename(self, item: Any, name: str) -> bool:
+        """
+        模拟宿主存储适配器同目录重命名
+        """
+        return self.fs_rename([(item.fileid, name)])["state"]
 
     def delete(self, item: Any) -> bool:
         """
