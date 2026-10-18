@@ -357,17 +357,17 @@ class TestResolveUploadedPickcode(TestCase):
         )
         self.resolve = namespace["_resolve_uploaded_pickcode"]
 
-    def _client(self, pickcode: str = "azogevddfjvyuh9a6") -> Any:
+    def _client(self, pickcode: str = "azogetestpick0001") -> Any:
         return SimpleNamespace(to_pickcode=lambda file_id: pickcode)
 
     def test_plain_numeric_fileid_is_used_directly(self) -> None:
         """
         纯数字文件 ID 直接转换，不做多余的路径查询
         """
-        item = SimpleNamespace(fileid="3280628841927671519")
+        item = SimpleNamespace(fileid="1234567890123456789")
         self.assertEqual(
             self.resolve(self._client(), item, Path("/x/y.mp4")),
-            "azogevddfjvyuh9a6",
+            "azogetestpick0001",
         )
         self.assertEqual(self.lookup_calls, [])
 
@@ -380,7 +380,7 @@ class TestResolveUploadedPickcode(TestCase):
             self.resolve(
                 self._client(), item, Path("/115open/MoviePilot/媒体库/a.mp4")
             ),
-            "azogevddfjvyuh9a6",
+            "azogetestpick0001",
         )
         self.assertEqual(self.lookup_calls, ["/115open/MoviePilot/媒体库/a.mp4"])
 
