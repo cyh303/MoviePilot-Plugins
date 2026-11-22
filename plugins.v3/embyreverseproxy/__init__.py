@@ -13,6 +13,12 @@ from .proxy_app import create_app
 
 PIN_RULES_SEP = " => "
 
+LISTEN_MODE_LABELS = {
+    "all": "全部：IPv4 + IPv6",
+    "ipv4": "仅 IPv4",
+    "ipv6": "仅 IPv6",
+}
+
 
 def _parse_pin_rules(raw: str) -> List[Tuple[str, str]]:
     """
@@ -63,7 +69,7 @@ class EmbyReverseProxy(_PluginBase):
         "Emby 302 反向代理，自动代理 HTTP 链接，跳转最终地址，支持外部播放器调用。"
     )
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/refs/heads/main/icons/Emby_A.png"
-    plugin_version = "3.0.1"
+    plugin_version = "3.0.2"
     plugin_author = "DDSRem"
     author_url = "https://github.com/DDSRem"
     plugin_config_prefix = "embyreverseproxy_"
@@ -73,6 +79,8 @@ class EmbyReverseProxy(_PluginBase):
     _enabled = False
     _emby_host = ""
     _host = "0.0.0.0"
+    _listen_mode = "all"
+    _v6only: Optional[bool] = None
     _port = 8099
     _pin_rules: List[Tuple[str, str]] = []
     _pin_rules_raw = ""
@@ -85,28 +93,57 @@ class EmbyReverseProxy(_PluginBase):
     _socket = None
 
     @staticmethod
-    def _create_listen_socket(host: str, port: int):
+    def _resolve_listen(host: str, listen_mode: str) -> Tuple[str, Optional[bool]]:
         """
-        为 IPv6 监听地址创建双栈 socket
+        把监听选项换算成 uvicorn 绑定地址与 IPV6_V6ONLY 取值
+
+        :param host (str): 旧配置的监听地址，仅在没有 listen_mode 时使用
+        :param listen_mode (str): all=IPv4+IPv6 双栈，ipv4=仅 IPv4，ipv6=仅 IPv6
+        :return: (绑定地址, IPV6_V6ONLY)；第二项为 None 表示交给 uvicorn 默认处理
+        """
+        mode = (listen_mode or "").strip().lower()
+        if mode == "ipv4":
+            return "0.0.0.0", None
+        if mode == "ipv6":
+            return "::", 1
+        if mode == "all":
+            return "::", 0
+
+        # 兼容旧配置：没有 listen_mode 时按原 host 推断
+        legacy = (host or "").strip()
+        if not legacy or legacy == "0.0.0.0":
+            return "0.0.0.0", None
+        if legacy == "::" or legacy == "::0":
+            # 旧版打补丁后 :: 即为双栈，保持一致
+            return "::", 0
+        return legacy, (0 if ":" in legacy else None)
+
+    @staticmethod
+    def _create_listen_socket(bind_host: str, port: int, v6only: Optional[bool]):
+        """
+        为 IPv6 绑定地址创建指定 V6ONLY 的 socket
 
         uvicorn 经 asyncio.create_server 绑定 IPv6 地址时会强制 IPV6_V6ONLY=1，
-        只接收 IPv6。域名仅有 AAAA 记录时可用，但局域网 IPv4 直连会全部失败。
-        这里自行创建 IPV6_V6ONLY=0 的 socket 交给 uvicorn，同时接受 IPv4 与 IPv6。
+        无法表达「双栈」。这里自行创建 socket 交给 uvicorn：
+        v6only=False 同时接受 IPv4 与 IPv6，v6only=True 只接受 IPv6。
 
-        :param host (str): 监听地址，含冒号时按 IPv6 处理
+        :param bind_host (str): 绑定地址，含冒号时按 IPv6 处理
         :param port (int): 监听端口
-        :return: 双栈监听 socket；非 IPv6 地址返回 None 走默认逻辑
+        :param v6only (bool): 是否只接收 IPv6；None 表示走 uvicorn 默认逻辑
+        :return: 监听 socket；返回 None 时由 uvicorn 自行创建
         """
-        if not host or ":" not in host:
+        if not bind_host or ":" not in bind_host or v6only is None:
             return None
         sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            sock.setsockopt(
+                socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1 if v6only else 0
+            )
         except (AttributeError, OSError):
-            logger.warning("无法关闭 IPV6_V6ONLY，IPv4 可能无法访问该端口")
+            logger.warning("无法设置 IPV6_V6ONLY，监听范围可能与配置不符")
         try:
-            sock.bind((host, port))
+            sock.bind((bind_host, port))
             sock.listen(2048)
         except OSError:
             sock.close()
@@ -123,7 +160,17 @@ class EmbyReverseProxy(_PluginBase):
         if config:
             self._enabled = config.get("enabled", False)
             self._emby_host = (config.get("emby_host") or "").strip()
-            self._host = (config.get("host") or "0.0.0.0").strip() or "0.0.0.0"
+            self._listen_mode = (config.get("listen_mode") or "").strip().lower()
+            self._host, self._v6only = self._resolve_listen(
+                config.get("host") or "", self._listen_mode
+            )
+            if self._listen_mode not in ("all", "ipv4", "ipv6"):
+                # 旧配置回填，便于表单直接显示当前生效选项
+                self._listen_mode = (
+                    "ipv4"
+                    if self._v6only is None
+                    else ("all" if self._v6only == 0 else "ipv6")
+                )
             try:
                 self._port = int(config.get("port") or 8099)
             except (TypeError, ValueError):
@@ -162,16 +209,19 @@ class EmbyReverseProxy(_PluginBase):
                     log_config=None,
                 )
                 self._server = Server(uv_config)
-                self._socket = self._create_listen_socket(self._host, self._port)
+                self._socket = self._create_listen_socket(
+                    self._host, self._port, self._v6only
+                )
                 run_kwargs = {"sockets": [self._socket]} if self._socket else {}
                 self._thread = Thread(
                     target=self._server.run, kwargs=run_kwargs, daemon=True
                 )
                 self._thread.start()
                 logger.info(
-                    "EmbyReverseProxy 代理已启动: %s:%s -> %s",
+                    "EmbyReverseProxy 代理已启动: %s:%s（%s）-> %s",
                     self._host,
                     self._port,
+                    LISTEN_MODE_LABELS.get(self._listen_mode, self._listen_mode),
                     self._emby_host,
                 )
             except Exception as e:
@@ -196,6 +246,7 @@ class EmbyReverseProxy(_PluginBase):
                 "enabled": self._enabled,
                 "emby_host": self._emby_host,
                 "host": self._host,
+                "listen_mode": self._listen_mode,
                 "port": self._port,
                 "pin_rules": self._pin_rules_raw,
                 "media_source_path_prefixes": self._media_source_path_prefixes_raw,
@@ -349,12 +400,23 @@ class EmbyReverseProxy(_PluginBase):
                         "props": {"cols": 12, "md": 3},
                         "content": [
                             {
-                                "component": "VTextField",
+                                "component": "VSelect",
                                 "props": {
-                                    "model": "host",
+                                    "model": "listen_mode",
                                     "label": "监听地址",
-                                    "placeholder": "0.0.0.0",
-                                    "hint": "代理监听地址",
+                                    "items": [
+                                        {
+                                            "title": "全部（IPv4 + IPv6）",
+                                            "value": "all",
+                                        },
+                                        {"title": "仅 IPv4", "value": "ipv4"},
+                                        {"title": "仅 IPv6", "value": "ipv6"},
+                                    ],
+                                    "hint": (
+                                        "全部：双栈监听，局域网 IPv4 与域名 IPv6 均可访问（推荐）；"
+                                        "仅 IPv4：只接受 IPv4 连接；"
+                                        "仅 IPv6：只接受 IPv6 连接，IPv4 设备将无法访问"
+                                    ),
                                     "persistent-hint": True,
                                 },
                             }
@@ -428,6 +490,7 @@ class EmbyReverseProxy(_PluginBase):
             "enabled": False,
             "emby_host": "",
             "host": "0.0.0.0",
+            "listen_mode": "all",
             "port": 8099,
             "pin_rules": "",
             "media_source_path_prefixes": "",

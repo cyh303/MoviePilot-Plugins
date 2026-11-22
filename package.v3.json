@@ -40,9 +40,9 @@
   },
   "EmbyReverseProxy": {
     "name": "Emby 302 反向代理",
-    "description": "Emby 302 反向代理，自动代理 HTTP 链接，跳转最终地址，支持外部播放器调用。（本地构建：修复 IPv6 监听地址只走 IPv6、IPv4 无法访问的问题）",
+    "description": "Emby 302 反向代理，自动代理 HTTP 链接，跳转最终地址，支持外部播放器调用。（本地构建：监听地址可选全部/IPv4/IPv6，修复 IPv6 监听时 IPv4 无法访问的问题）",
     "labels": "云盘,媒体",
-    "version": "3.0.1",
+    "version": "3.0.2",
     "release": true,
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/refs/heads/main/icons/Emby_A.png",
     "author": "DDSRem",
@@ -50,7 +50,8 @@
     "level": 1,
     "history": {
       "v3.0.0": "适配 MoviePilot V3 SDK 与插件依赖清单",
-      "v3.0.1": "本地补丁构建（基于 3.0.0）：修复监听地址设为 IPv6（如 ::）时只监听 IPv6 的问题。uvicorn 经 asyncio.create_server 绑定 IPv6 地址会强制 IPV6_V6ONLY=1，导致 127.0.0.1 与局域网 IPv4 全部无法访问；改为自行创建 IPV6_V6ONLY=0 的双栈 socket 交给 uvicorn，并在 stop_service 与启动异常分支关闭该 socket。"
+      "v3.0.1": "本地补丁构建（基于 3.0.0）：修复监听地址设为 IPv6（如 ::）时只监听 IPv6 的问题。uvicorn 经 asyncio.create_server 绑定 IPv6 地址会强制 IPV6_V6ONLY=1，导致 127.0.0.1 与局域网 IPv4 全部无法访问；改为自行创建 IPV6_V6ONLY=0 的双栈 socket 交给 uvicorn，并在 stop_service 与启动异常分支关闭该 socket。",
+      "v3.0.2": "监听地址改为下拉选择：「全部（IPv4 + IPv6）」双栈监听、「仅 IPv4」、「仅 IPv6」，按需只监听指定协议。全部模式下自行创建 IPV6_V6ONLY=0 的 socket 交给 uvicorn，解决 host 设为 :: 时 asyncio 强制 IPV6_V6ONLY=1、局域网 IPv4 无法访问的问题；旧配置自动按原 host 推断等价选项，无需手动迁移。"
     }
   }
 }
