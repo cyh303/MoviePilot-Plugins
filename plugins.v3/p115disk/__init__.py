@@ -30,9 +30,9 @@ class P115Disk(_PluginBase):
     # 插件版本
     plugin_version = "3.0.3.4"
     # 插件作者
-    plugin_author = "DDSRem"
+    plugin_author = "cyh303"
     # 作者主页
-    author_url = "https://github.com/DDSRem"
+    author_url = "https://github.com/cyh303"
     # 插件配置项ID前缀
     plugin_config_prefix = "p115disk_"
     # 加载顺序

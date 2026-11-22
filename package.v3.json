@@ -26,7 +26,7 @@
     "labels": "云盘",
     "version": "3.0.3.4",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
-    "author": "DDSRem",
+    "author": "cyh303",
     "release": true,
     "system_version": ">=3.0.0",
     "level": 1,
