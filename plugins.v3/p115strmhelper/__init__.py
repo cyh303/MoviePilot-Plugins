@@ -1,3 +1,7 @@
+# 本插件基于上游 DDSRem-Dev/MoviePilot-Plugins 的 115网盘STRM助手 3.0.2 二次开发。
+# 原作者：DDSRem（https://github.com/DDSRem）
+# 上游仓库：https://github.com/DDSRem-Dev/MoviePilot-Plugins
+# 本仓库仅维护本地补丁与后续修改，版权与主要贡献归原作者。
 from time import sleep
 from copy import deepcopy
 from dataclasses import asdict
