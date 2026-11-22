@@ -37,5 +37,20 @@
       "v3.0.3.1": "本地补丁构建（基于 3.0.3）：修复 get_pid_by_path 两处缺陷 —— ①命中目录后未写入路径缓存，导致每次 list 都重新请求 115 接口并受 1s 限速拖慢；②在 web/app 接口间交替调用，web 接口偶发 405 Method Not Allowed 时整次调用直接返回 -1，表现为目录列举间隔性返回空列表。改为 app 接口优先、web 仅作回退，成功后写入路径缓存；同时把 115 返回的字符串 id 归一化为 int，使上层 == -1 判定可靠。新增 tests/test_p115_api_get_pid.py（6 个用例：缓存命中、app→web 回退、双接口失败、根路径、id=0 建目录、降级 get_item）。",
       "v3.0.3": "对齐 MoviePilot V3 宿主插件框架。"
     }
+  },
+  "EmbyReverseProxy": {
+    "name": "Emby 302 反向代理",
+    "description": "Emby 302 反向代理，自动代理 HTTP 链接，跳转最终地址，支持外部播放器调用。（本地构建：修复 IPv6 监听地址只走 IPv6、IPv4 无法访问的问题）",
+    "labels": "云盘,媒体",
+    "version": "3.0.1",
+    "release": true,
+    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/refs/heads/main/icons/Emby_A.png",
+    "author": "DDSRem",
+    "system_version": ">=3.0.0",
+    "level": 1,
+    "history": {
+      "v3.0.0": "适配 MoviePilot V3 SDK 与插件依赖清单",
+      "v3.0.1": "本地补丁构建（基于 3.0.0）：修复监听地址设为 IPv6（如 ::）时只监听 IPv6 的问题。uvicorn 经 asyncio.create_server 绑定 IPv6 地址会强制 IPV6_V6ONLY=1，导致 127.0.0.1 与局域网 IPv4 全部无法访问；改为自行创建 IPV6_V6ONLY=0 的双栈 socket 交给 uvicorn，并在 stop_service 与启动异常分支关闭该 socket。"
+    }
   }
 }
