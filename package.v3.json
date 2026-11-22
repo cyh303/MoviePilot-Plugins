@@ -45,7 +45,7 @@
     "version": "3.0.2",
     "release": true,
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/refs/heads/main/icons/Emby_A.png",
-    "author": "DDSRem",
+    "author": "cyh303",
     "system_version": ">=3.0.0",
     "level": 1,
     "history": {
