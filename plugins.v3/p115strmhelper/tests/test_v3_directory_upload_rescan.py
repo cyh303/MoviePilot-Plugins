@@ -123,6 +123,7 @@ class TestDirectoryUploadRescan(TestCase):
             [
                 "_is_directory_upload_ignored_path",
                 "_directory_upload_extensions",
+                "_upload_key",
                 "DirectoryUploadRescan",
                 "directory_upload_rescan",
             ],
@@ -199,6 +200,44 @@ class TestDirectoryUploadRescan(TestCase):
         self.assertEqual(len(self.submitted), 1)
         self.assertTrue(self.submitted[0][0].endswith("ep1.mkv"))
         self.assertTrue(self.logger.warning.called)
+
+    def test_collect_missing_stops_when_stop_event_is_set(self) -> None:
+        """
+        停止事件已置位时扫描立即返回，不再遍历整棵目录树
+        """
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            library = self._build_tree(Path(tmpdir))
+            rescan = self.rescan_cls()
+            rescan._stop_event = Event()
+            rescan._stop_event.set()
+            missing = rescan._collect_missing([(str(library), str(library))], 50)
+
+        self.assertEqual(missing, [])
+
+    def test_tick_backs_off_repeatedly_failing_files(self) -> None:
+        """
+        同一文件连续多轮仍缺少 STRM 时按退避跳过，避免每轮重复上传
+        """
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            library = self._build_tree(Path(tmpdir))
+            rescan = self.rescan_cls()
+            rescan._max_submit = lambda: 10
+            entries = [(str(library), str(library))]
+            rescan._tick(None, entries)
+            first_round = len(self.submitted)
+            rescan._tick(None, entries)
+            second_round = len(self.submitted)
+            # 退避窗口内不会再次提交
+            rescan._tick(None, entries)
+            third_round = len(self.submitted)
+
+        self.assertEqual(first_round, 1)
+        self.assertEqual(second_round, first_round)
+        self.assertEqual(third_round, first_round)
 
     def test_rotate_entries_advances_start_directory(self) -> None:
         """

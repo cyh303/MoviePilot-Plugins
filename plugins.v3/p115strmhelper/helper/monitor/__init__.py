@@ -785,6 +785,10 @@ class DirectoryUploadRescan:
     DEFAULT_INTERVAL_MINUTES = 10
     DEFAULT_MAX_SUBMIT = 300
     FIRST_SCAN_DELAY_SECONDS = 120
+    # 反复失败的漏传文件按轮次退避，避免每轮重复上传浪费网盘配额
+    MAX_RETRY_BACKOFF_ROUNDS = 36
+    # 停止事件检查粒度：每遍历这么多个文件检查一次
+    STOP_CHECK_FILE_INTERVAL = 200
 
     def __init__(self) -> None:
         self._thread: Optional[Thread] = None
@@ -793,6 +797,10 @@ class DirectoryUploadRescan:
         self._lifecycle_lock = Lock()
         # 轮转起点：保证每个监控目录都能在有限轮次内成为首个扫描目标
         self._rotation_index = 0
+        # 巡检轮次计数，仅用于计算退避窗口
+        self._round_index = 0
+        # 反复提交仍缺少 STRM 的文件：去重身份 -> (允许再次提交的轮次, 已失败次数)
+        self._retry_state = {}
 
     @staticmethod
     def _config_bool(key: str, default: bool) -> bool:
@@ -923,10 +931,17 @@ class DirectoryUploadRescan:
         upload_extensions = _directory_upload_extensions("directory_upload_uploadext")
         allowed_extensions = set(upload_extensions) if upload_extensions is not None else None
         missing: List[Tuple[str, str]] = []
+        stop_event = self._stop_event
+        scanned = 0
         for mon_path, dest_strm in entries:
+            if stop_event is not None and stop_event.is_set():
+                return missing
             if not Path(mon_path).is_dir():
                 continue
             for current_dir, dir_names, file_names in os_walk(mon_path, followlinks=False):
+                # 大目录树遍历期间及时响应停止，避免卸载等待超时
+                if stop_event is not None and stop_event.is_set():
+                    return missing
                 current = Path(current_dir)
                 dir_names[:] = [
                     name
@@ -934,6 +949,13 @@ class DirectoryUploadRescan:
                     if not _is_directory_upload_ignored_path(current / name)
                 ]
                 for name in file_names:
+                    scanned += 1
+                    if (
+                        stop_event is not None
+                        and scanned % self.STOP_CHECK_FILE_INTERVAL == 0
+                        and stop_event.is_set()
+                    ):
+                        return missing
                     file_path = current / name
                     if (
                         allowed_extensions is not None
@@ -952,6 +974,41 @@ class DirectoryUploadRescan:
                         return missing
         return missing
 
+    def _retry_allow_round(self, upload_key: Tuple[str, str]) -> int:
+        """
+        读取某个漏传文件允许再次提交的轮次
+
+        :param upload_key (Tuple): 去重身份
+
+        :return int: 允许提交的轮次，0 表示本轮即可提交
+        """
+        state = self._retry_state.get(upload_key)
+        return state[0] if state else 0
+
+    def _mark_retry(self, upload_key: Tuple[str, str]) -> None:
+        """
+        记录一次「已提交但仍缺少 STRM」，按失败次数指数退避
+
+        :param upload_key (Tuple): 去重身份
+        """
+        state = self._retry_state.get(upload_key)
+        failures = (state[1] if state else 0) + 1
+        # 跳过 2/4/8… 轮（指数退避，上限 MAX_RETRY_BACKOFF_ROUNDS），
+        # +1 用于抵消本轮计数，保证本轮记下的窗口从下一轮开始生效
+        backoff = min(2 ** failures, self.MAX_RETRY_BACKOFF_ROUNDS)
+        self._retry_state[upload_key] = (
+            self._round_index + int(backoff) + 1,
+            failures,
+        )
+
+    def _clear_retry(self, upload_key: Tuple[str, str]) -> None:
+        """
+        清除某个文件的退避记录（STRM 已生成或文件已消失）
+
+        :param upload_key (Tuple): 去重身份
+        """
+        self._retry_state.pop(upload_key, None)
+
     def _tick(self, client: P115Client, entries: List[Tuple[str, str]]) -> None:
         """
         执行一轮漏传巡检并按上限提交
@@ -961,15 +1018,29 @@ class DirectoryUploadRescan:
         """
         limit = self._max_submit()
         missing = self._collect_missing(entries, limit + 1)
+        if self._stop_event is not None and self._stop_event.is_set():
+            # 停止过程中扫描被中断，本轮不再提交，避免卸载期间继续上传
+            return
         if not missing:
             logger.debug("【目录上传】漏传巡检：未发现缺少 STRM 的本地文件")
             return
+        self._round_index += 1
         overflow = len(missing) > limit
         submitted = 0
+        deferred = 0
         for file_path, mon_path in missing[:limit]:
+            upload_key = _upload_key(Path(file_path), mon_path)
+            if self._retry_allow_round(upload_key) > self._round_index:
+                # 已多次提交仍缺少 STRM，按退避窗口跳过，避免重复上传浪费配额
+                deferred += 1
+                continue
+            if not Path(file_path).exists():
+                self._clear_retry(upload_key)
+                continue
             try:
                 if directory_upload_stability_tracker.submit(client, file_path, mon_path):
                     submitted += 1
+                    self._mark_retry(upload_key)
             except Exception as e:
                 logger.error(
                     f"【目录上传】漏传巡检提交 {file_path} 失败: {e}", exc_info=True
@@ -977,6 +1048,7 @@ class DirectoryUploadRescan:
         logger.warning(
             f"【目录上传】漏传巡检：发现 {len(missing)} 个本地文件缺少 STRM，"
             f"本轮新增提交 {submitted} 个"
+            + (f"，按退避跳过 {deferred} 个" if deferred else "")
             + ("（超出本轮上限，剩余将在下轮继续）" if overflow else "")
         )
 
